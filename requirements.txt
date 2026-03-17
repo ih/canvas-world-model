@@ -2,3 +2,9 @@ numpy
 Pillow
 matplotlib
 tqdm
+av
+pandas
+pyarrow
+torch
+torchvision
+wandb

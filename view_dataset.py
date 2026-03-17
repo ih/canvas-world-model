@@ -4,9 +4,7 @@ import os
 import argparse
 import json
 from pathlib import Path
-import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
 from PIL import Image
 
 
@@ -22,7 +20,6 @@ class DatasetViewer:
         self.dataset_dir = dataset_dir
 
         # Load canvas paths
-        canvas_pattern = os.path.join(dataset_dir, 'canvas_*.png')
         self.canvas_paths = sorted(Path(dataset_dir).glob('canvas_*.png'))
 
         if not self.canvas_paths:

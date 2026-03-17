@@ -1,162 +1,277 @@
-"""Test script to verify canvas creation and dataset integrity."""
+"""Tests for canvas creation from LeRobot v3.0 datasets.
+
+Unit tests use synthetic data (no external dependencies).
+Integration tests require a real LeRobot dataset on disk and are skipped if absent.
+"""
 
 import json
-import os
+import tempfile
 from pathlib import Path
-from PIL import Image
+
 import numpy as np
+import pytest
 
 import config
-from data.session_loader import (
-    load_session_metadata,
-    load_session_events,
-    extract_observations,
-    extract_actions,
-    load_frame_image,
-)
 from data.canvas_builder import build_canvas
+from data.lerobot_loader import (
+    DiscreteActionLog,
+    EpisodeFrameActions,
+    get_decision_frame_indices,
+    load_discrete_action_log,
+    resize_frame,
+    stack_frames,
+)
 
 
-def test_session_loading():
-    """Test that sessions load correctly."""
-    print("Testing session loading...")
-
-    session_dir = "local/sessions/session_so101_multiheight_part1_1345"
-
-    meta = load_session_metadata(session_dir)
-    assert meta is not None, "Failed to load metadata"
-    assert meta['session_name'] == 'session_so101_multiheight_part1_1345'
-    print(f"  [OK] Metadata loaded: {meta['session_name']}")
-
-    events = load_session_events(session_dir)
-    assert len(events) == 2690, f"Expected 2690 events, got {len(events)}"
-    print(f"  [OK] Loaded {len(events)} events")
-
-    observations = extract_observations(events, session_dir)
-    assert len(observations) == 1345, f"Expected 1345 observations, got {len(observations)}"
-    print(f"  [OK] Extracted {len(observations)} observations")
-
-    actions = extract_actions(events)
-    assert len(actions) == 1345, f"Expected 1345 actions, got {len(actions)}"
-    print(f"  [OK] Extracted {len(actions)} actions")
+# ---------------------------------------------------------------------------
+# Unit tests (always run, no external data needed)
+# ---------------------------------------------------------------------------
 
 
-def test_frame_loading():
-    """Test that frames load correctly."""
-    print("\nTesting frame loading...")
+class TestDiscreteActionLogParsing:
+    def test_load_log(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            f.write(json.dumps({"type": "header", "joint_name": "shoulder_pan.pos",
+                                "action_duration": 0.39, "position_delta": 15.0}) + "\n")
+            f.write(json.dumps({"type": "action", "discrete_action": 0, "frame_index": 0}) + "\n")
+            f.write(json.dumps({"type": "action", "discrete_action": 1, "frame_index": 4}) + "\n")
+            f.write(json.dumps({"type": "action", "discrete_action": 2, "frame_index": 8}) + "\n")
+            tmp_path = Path(f.name)
 
-    session_dir = "local/sessions/session_so101_multiheight_part1_1345"
-    events = load_session_events(session_dir)
-    observations = extract_observations(events, session_dir)
+        log = load_discrete_action_log(tmp_path)
+        tmp_path.unlink()
 
-    # Load first frame
-    frame = load_frame_image(observations[0]['full_path'])
-    frame_array = np.array(frame)
+        assert log is not None
+        assert log.joint_name == "shoulder_pan.pos"
+        assert log.action_duration == 0.39
+        assert len(log.decisions) == 3
+        assert log.decisions[0]["discrete_action"] == 0
+        assert log.decisions[2]["frame_index"] == 8
 
-    assert frame_array.shape == (448, 224, 3), f"Unexpected frame shape: {frame_array.shape}"
-    assert frame_array.dtype == np.uint8, f"Unexpected dtype: {frame_array.dtype}"
-    print(f"  [OK] Frame shape: {frame_array.shape}")
-    print(f"  [OK] Frame dtype: {frame_array.dtype}")
+    def test_load_missing_file(self):
+        assert load_discrete_action_log(Path("/nonexistent.jsonl")) is None
 
+    def test_load_header_only(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            f.write(json.dumps({"type": "header", "joint_name": "test"}) + "\n")
+            tmp_path = Path(f.name)
 
-def test_canvas_building():
-    """Test that canvases build correctly."""
-    print("\nTesting canvas building...")
+        log = load_discrete_action_log(tmp_path)
+        tmp_path.unlink()
 
-    session_dir = "local/sessions/session_so101_multiheight_part1_1345"
-    events = load_session_events(session_dir)
-    observations = extract_observations(events, session_dir)
-    actions = extract_actions(events)
-
-    # Load frames for canvas at index 5
-    frame_idx = 5
-    start_idx = frame_idx - (config.CANVAS_HISTORY_SIZE - 1)
-
-    frames = [np.array(load_frame_image(observations[i]['full_path'])) for i in range(start_idx, frame_idx + 1)]
-    actions_list = [actions[i]['action'] for i in range(start_idx, frame_idx)]
-
-    interleaved = []
-    for i in range(len(frames)):
-        interleaved.append(frames[i])
-        if i < len(actions_list):
-            interleaved.append(actions_list[i])
-
-    canvas = build_canvas(interleaved, frame_size=(448, 224), sep_width=config.SEPARATOR_WIDTH)
-
-    expected_w = 224 * 3 + 32 * 2  # 3 frames + 2 separators
-    expected_h = 448
-
-    assert canvas.shape == (expected_h, expected_w, 3), f"Unexpected canvas shape: {canvas.shape}"
-    assert canvas.dtype == np.uint8, f"Unexpected canvas dtype: {canvas.dtype}"
-    print(f"  [OK] Canvas shape: {canvas.shape}")
-    print(f"  [OK] Canvas dtype: {canvas.dtype}")
-
-    # Verify separators have color (not black)
-    sep1_mean = canvas[:, 224:256].mean()
-    sep2_mean = canvas[:, 480:512].mean()
-    assert sep1_mean > 0, "First separator appears to be all black"
-    assert sep2_mean > 0, "Second separator appears to be all black"
-    print(f"  [OK] Separators have color (mean: {sep1_mean:.1f}, {sep2_mean:.1f})")
+        assert log is not None
+        assert len(log.decisions) == 0
 
 
-def test_dataset_integrity():
-    """Test that created datasets are valid."""
-    print("\nTesting dataset integrity...")
+class TestDecisionFrameIndices:
+    def test_basic_mapping(self):
+        log = DiscreteActionLog(
+            header={"joint_name": "test"},
+            decisions=[
+                {"type": "action", "discrete_action": 0, "frame_index": 0},
+                {"type": "action", "discrete_action": 1, "frame_index": 4},
+                {"type": "action", "discrete_action": 2, "frame_index": 8},
+            ],
+        )
+        result = get_decision_frame_indices(log, total_frames=100)
+        assert result == [(0, 0), (4, 1), (8, 2)]
 
-    datasets = [
-        ("local/datasets/part1", 1343, "session_so101_multiheight_part1_1345"),
-        ("local/datasets/part2", 148, "session_so101_multiheight_part2_149"),
-    ]
+    def test_clamping(self):
+        log = DiscreteActionLog(
+            header={},
+            decisions=[{"type": "action", "discrete_action": 1, "frame_index": 999}],
+        )
+        result = get_decision_frame_indices(log, total_frames=10)
+        assert result == [(9, 1)]
 
-    for dataset_dir, expected_count, expected_session in datasets:
-        if not os.path.exists(dataset_dir):
-            print(f"  [SKIP] Dataset {dataset_dir} not found")
-            continue
+    def test_empty_decisions(self):
+        log = DiscreteActionLog(header={}, decisions=[])
+        assert get_decision_frame_indices(log, 10) == []
 
-        # Count canvases
-        canvas_files = list(Path(dataset_dir).glob('canvas_*.png'))
-        assert len(canvas_files) == expected_count, f"Expected {expected_count} canvases, got {len(canvas_files)}"
-        print(f"  [OK] {dataset_dir}: {len(canvas_files)} canvases")
-
-        # Check metadata
-        meta_path = os.path.join(dataset_dir, 'dataset_meta.json')
-        assert os.path.exists(meta_path), f"Metadata not found in {dataset_dir}"
-        with open(meta_path, 'r') as f:
-            meta = json.load(f)
-
-        assert meta['session_name'] == expected_session
-        assert meta['canvas_count'] == expected_count
-        assert meta['canvas_size'] == [448, 736]
-        print(f"      Metadata: {meta['canvas_count']} canvases, size {meta['canvas_size']}")
-
-        # Spot check a few canvases
-        for canvas_idx in [0, expected_count // 2, expected_count - 1]:
-            canvas_path = os.path.join(dataset_dir, f'canvas_{canvas_idx:05d}.png')
-            canvas = Image.open(canvas_path)
-            assert canvas.size == (736, 448), f"Canvas {canvas_idx} has wrong size: {canvas.size}"
-
-        print(f"      Canvas files valid (spot checked {min(3, expected_count)} files)")
+    def test_missing_frame_index_raises(self):
+        log = DiscreteActionLog(
+            header={},
+            decisions=[{"type": "action", "discrete_action": 0}],
+        )
+        with pytest.raises(ValueError, match="missing 'frame_index'"):
+            get_decision_frame_indices(log, 10)
 
 
-if __name__ == '__main__':
-    print("=" * 60)
-    print("Canvas World Model - Test Suite")
-    print("=" * 60)
+class TestResizeAndStack:
+    def test_resize(self):
+        frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        resized = resize_frame(frame, (224, 224))
+        assert resized.shape == (224, 224, 3)
 
-    try:
-        test_session_loading()
-        test_frame_loading()
-        test_canvas_building()
-        test_dataset_integrity()
+    def test_stack_vertical(self):
+        f1 = np.zeros((100, 200, 3), dtype=np.uint8)
+        f2 = np.ones((100, 200, 3), dtype=np.uint8) * 255
+        stacked = stack_frames([f1, f2], "vertical")
+        assert stacked.shape == (200, 200, 3)
 
-        print("\n" + "=" * 60)
-        print("[OK] All tests passed!")
-        print("=" * 60)
-    except AssertionError as e:
-        print(f"\n[FAIL] Test failed: {e}")
-        exit(1)
-    except Exception as e:
-        print(f"\n[FAIL] Unexpected error: {e}")
-        import traceback
-        traceback.print_exc()
-        exit(1)
+    def test_stack_horizontal(self):
+        f1 = np.zeros((100, 200, 3), dtype=np.uint8)
+        f2 = np.ones((100, 200, 3), dtype=np.uint8) * 255
+        stacked = stack_frames([f1, f2], "horizontal")
+        assert stacked.shape == (100, 400, 3)
+
+    def test_stack_single(self):
+        f1 = np.zeros((100, 200, 3), dtype=np.uint8)
+        stacked = stack_frames([f1], "single")
+        assert stacked.shape == (100, 200, 3)
+
+
+class TestCanvasBuilding:
+    def _make_frame(self, color, h=448, w=224):
+        frame = np.zeros((h, w, 3), dtype=np.uint8)
+        frame[:] = color
+        return frame
+
+    def test_canvas_shape(self):
+        frames = [self._make_frame(c) for c in [(255, 0, 0), (0, 255, 0), (0, 0, 255)]]
+        actions = [0, 1]  # stay, move+
+        interleaved = [frames[0], actions[0], frames[1], actions[1], frames[2]]
+
+        canvas = build_canvas(interleaved, frame_size=(448, 224), sep_width=32)
+
+        expected_w = 224 * 3 + 32 * 2
+        assert canvas.shape == (448, expected_w, 3)
+        assert canvas.dtype == np.uint8
+
+    def test_separator_colors(self):
+        frames = [self._make_frame((128, 128, 128)) for _ in range(3)]
+        actions = [0, 1]  # stay=red, move+=green
+        interleaved = [frames[0], actions[0], frames[1], actions[1], frames[2]]
+
+        canvas = build_canvas(interleaved, frame_size=(448, 224), sep_width=32)
+
+        # First separator (action=0 -> red)
+        sep1 = canvas[:, 224:256]
+        assert sep1[0, 0, 0] == 255  # R
+        assert sep1[0, 0, 1] == 0    # G
+        assert sep1[0, 0, 2] == 0    # B
+
+        # Second separator (action=1 -> green)
+        sep2 = canvas[:, 480:512]
+        assert sep2[0, 0, 0] == 0
+        assert sep2[0, 0, 1] == 255
+        assert sep2[0, 0, 2] == 0
+
+    def test_canvas_with_action_dicts(self):
+        """Canvas builder also accepts action dicts."""
+        frames = [self._make_frame((0, 0, 0)) for _ in range(2)]
+        interleaved = [frames[0], {"action": 2}, frames[1]]
+
+        canvas = build_canvas(interleaved, frame_size=(448, 224), sep_width=32)
+        sep = canvas[:, 224:256]
+        assert sep[0, 0, 2] == 255  # Blue for action=2
+
+
+class TestEpisodeBoundary:
+    def test_no_canvas_crossover(self):
+        """Canvases should not span two episodes."""
+        history = config.CANVAS_HISTORY_SIZE
+
+        # Two short episodes, each with 4 frames
+        ep1 = EpisodeFrameActions(
+            frames=[np.zeros((10, 10, 3), dtype=np.uint8) for _ in range(4)],
+            actions=[0, 1, 2],
+            episode_index=0,
+        )
+        ep2 = EpisodeFrameActions(
+            frames=[np.ones((10, 10, 3), dtype=np.uint8) * 255 for _ in range(4)],
+            actions=[1, 0, 2],
+            episode_index=1,
+        )
+
+        # Simulate the canvas loop from create_dataset
+        canvas_count = 0
+        for ep in [ep1, ep2]:
+            valid_start = history - 1
+            for frame_idx in range(valid_start, len(ep.frames)):
+                start_idx = frame_idx - (history - 1)
+                window_frames = ep.frames[start_idx : frame_idx + 1]
+                window_actions = ep.actions[start_idx : frame_idx]
+                assert len(window_frames) == history
+                assert len(window_actions) == history - 1
+                canvas_count += 1
+
+        # Each episode: 4 frames, history=3, so 2 canvases per episode
+        assert canvas_count == 4
+
+
+# ---------------------------------------------------------------------------
+# Integration tests (require real LeRobot dataset on disk)
+# ---------------------------------------------------------------------------
+
+DATASET_PATH = Path.home() / ".cache" / "huggingface" / "lerobot" / "irvinh" / "eval_shoulder_pan_10_minutes"
+skip_no_data = pytest.mark.skipif(
+    not DATASET_PATH.exists(),
+    reason="LeRobot dataset not available at expected path",
+)
+
+
+@skip_no_data
+class TestLeRobotIntegration:
+    def test_reader(self):
+        from data.lerobot_loader import LeRobotV3Reader
+
+        reader = LeRobotV3Reader(str(DATASET_PATH))
+        assert reader.total_episodes >= 1
+        assert reader.fps > 0
+
+        episodes = list(reader.iterate_episodes())
+        assert len(episodes) >= 1
+        assert episodes[0]["length"] > 0
+
+    def test_load_episode(self):
+        from data.lerobot_loader import load_episode, LeRobotV3Reader
+
+        reader = LeRobotV3Reader(str(DATASET_PATH))
+        ep = load_episode(
+            reader,
+            episode_index=0,
+            cameras=["base_0_rgb", "left_wrist_0_rgb"],
+            stack_mode="vertical",
+            frame_size=(224, 224),
+        )
+
+        assert len(ep.frames) > 10
+        assert len(ep.actions) == len(ep.frames) - 1
+        assert ep.frames[0].shape == (448, 224, 3)  # 2 cameras stacked vertically
+        assert all(a in (0, 1, 2) for a in ep.actions)
+
+    def test_full_pipeline(self):
+        from data.lerobot_loader import load_dataset
+
+        episodes = load_dataset(
+            lerobot_path=str(DATASET_PATH),
+            cameras=["base_0_rgb"],
+            stack_mode="single",
+            frame_size=(224, 224),
+            episode=0,
+        )
+
+        assert len(episodes) == 1
+        ep = episodes[0]
+
+        # Build one canvas
+        history = config.CANVAS_HISTORY_SIZE
+        frames = ep.frames[:history]
+        actions = ep.actions[: history - 1]
+
+        interleaved = []
+        for i in range(len(frames)):
+            interleaved.append(frames[i])
+            if i < len(actions):
+                interleaved.append(actions[i])
+
+        canvas = build_canvas(
+            interleaved,
+            frame_size=(frames[0].shape[0], frames[0].shape[1]),
+            sep_width=config.SEPARATOR_WIDTH,
+        )
+
+        assert canvas.shape[0] == 224
+        expected_w = 224 * history + config.SEPARATOR_WIDTH * (history - 1)
+        assert canvas.shape[1] == expected_w

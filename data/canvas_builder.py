@@ -1,19 +1,15 @@
 """Canvas building from interleaved frame and action sequences."""
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 
 
 def _separator_color_for_action(action_dict: dict) -> tuple:
     """Get RGB color for an action separator.
 
-    Handles multiple action formats:
-    - Dict with 'action' int key: 0->Red, 1->Green, 2->Blue
-    - Dict with 'motor_right' key: Red to Green linear blend (0.0 to 0.12)
-    - Plain int: treated as action int
-
     Args:
-        action_dict: Action dictionary or int
+        action_dict: Action dictionary with 'action' int key, or plain int.
+            0->Red, 1->Green, 2->Blue.
 
     Returns:
         (R, G, B) tuple with values 0-255
@@ -22,19 +18,7 @@ def _separator_color_for_action(action_dict: dict) -> tuple:
     if isinstance(action_dict, int):
         action_int = action_dict
     elif isinstance(action_dict, dict):
-        # Try 'action' key first
-        if 'action' in action_dict:
-            action_int = action_dict['action']
-        # Try motor-based format
-        elif 'motor_right' in action_dict:
-            motor_val = action_dict['motor_right']
-            # Linear blend: 0.0 -> Red (255,0,0), 0.12 -> Green (0,255,0)
-            t = min(1.0, max(0.0, motor_val / 0.12))
-            r = int(255 * (1 - t))
-            g = int(255 * t)
-            return (r, g, 0)
-        else:
-            action_int = 0  # Default to stay
+        action_int = action_dict.get('action', 0)
     else:
         action_int = 0
 
@@ -150,62 +134,3 @@ def build_canvas(
             x_offset += sep_width
 
     return canvas
-
-
-def build_canvas_for_frame(
-    observations: list,
-    actions: list,
-    frame_idx: int,
-    sep_width: int,
-    history_size: int,
-) -> np.ndarray | None:
-    """Convenience wrapper to build a canvas for a single frame.
-
-    Assembles the interleaved frame/action list and calls build_canvas().
-    Automatically detects frame size from the first available image.
-
-    Args:
-        observations: List of observation dicts from extract_observations()
-        actions: List of action dicts from extract_actions()
-        frame_idx: Index of the target frame (final frame in the canvas)
-        sep_width: Width of action separators (SEPARATOR_WIDTH)
-        history_size: Number of frames to include (CANVAS_HISTORY_SIZE)
-
-    Returns:
-        Canvas as numpy uint8 array, or None if insufficient history available
-    """
-    from .session_loader import load_frame_image
-
-    # Check if we have enough history
-    start_idx = frame_idx - (history_size - 1)
-    if start_idx < 0:
-        return None
-
-    # Load frames
-    frames = []
-    for i in range(start_idx, frame_idx + 1):
-        if i >= len(observations):
-            return None
-        frame_img = load_frame_image(observations[i]['full_path'])
-        frames.append(np.array(frame_img))
-
-    # Detect frame size from first frame
-    frame_size = (frames[0].shape[0], frames[0].shape[1])
-
-    # Get actions between frames
-    frame_actions = []
-    for i in range(start_idx, frame_idx):
-        if i < len(actions):
-            frame_actions.append(actions[i]['action'])
-        else:
-            # Default to stay action if not available
-            frame_actions.append({'action': 0})
-
-    # Build interleaved list
-    interleaved = []
-    for i in range(len(frames)):
-        interleaved.append(frames[i])
-        if i < len(frame_actions):
-            interleaved.append(frame_actions[i])
-
-    return build_canvas(interleaved, frame_size, sep_width)

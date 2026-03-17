@@ -1,144 +1,196 @@
-"""Create a dataset by building all canvases from a session and saving as PNGs."""
+"""Create a canvas dataset from a LeRobot v3.0 dataset.
 
-import os
+Usage:
+    python create_dataset.py --lerobot-path irvinh/single-action-shoulder-pan-500
+    python create_dataset.py --lerobot-path irvinh/single-action-shoulder-pan-500 --output local/datasets/my_dataset
+"""
+
 import json
 import argparse
 from pathlib import Path
-import numpy as np
+
 from PIL import Image
 from tqdm import tqdm
 
 import config
-from data.session_loader import (
-    load_session_metadata,
-    load_session_events,
-    extract_observations,
-    extract_actions,
-    load_frame_image,
-)
+from data.lerobot_loader import load_dataset
 from data.canvas_builder import build_canvas
 
 
-def create_dataset(session_dir: str, output_dir: str) -> None:
-    """Build all canvases from a session and save as PNGs.
+def create_dataset(
+    lerobot_path: str,
+    output_dir: str,
+    cameras: list,
+    stack_mode: str,
+    frame_size: tuple,
+    episode: int = None,
+) -> None:
+    """Build all canvases from a LeRobot dataset and save as PNGs.
 
     Args:
-        session_dir: Path to session directory
+        lerobot_path: Path to LeRobot v3.0 dataset or HuggingFace repo_id
         output_dir: Path to output directory (will be created)
+        cameras: Camera keys to extract
+        stack_mode: How to combine cameras
+        frame_size: Per-camera (H, W) resize target
+        episode: Specific episode index, or None for all episodes
     """
-    # Create output directory
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    # Load session
-    print(f"Loading session from {session_dir}...")
-    meta = load_session_metadata(session_dir)
-    events = load_session_events(session_dir)
-    observations = extract_observations(events, session_dir)
-    actions = extract_actions(events)
+    # Load episodes
+    episodes = load_dataset(
+        lerobot_path=lerobot_path,
+        cameras=cameras,
+        stack_mode=stack_mode,
+        frame_size=frame_size,
+        episode=episode,
+    )
 
-    print(f"  Loaded {len(observations)} observations, {len(actions)} actions")
+    if not episodes:
+        print("No episodes loaded.")
+        return
 
-    # Load all frames to detect frame size
-    print("Loading frames and detecting frame size...")
-    frame_images = []
-    detected_frame_size = None
+    # Detect frame size from first frame (after camera stacking)
+    detected_frame_size = (episodes[0].frames[0].shape[0], episodes[0].frames[0].shape[1])
+    print(f"\nDetected stacked frame size: {detected_frame_size}")
 
-    for obs in tqdm(observations, desc="Loading frames"):
-        img = load_frame_image(obs['full_path'])
-        img_array = np.array(img)
-        frame_images.append(img_array)
-
-        if detected_frame_size is None:
-            detected_frame_size = (img_array.shape[0], img_array.shape[1])
-
-    print(f"  Detected frame size: {detected_frame_size}")
-
-    # Build canvases
+    # Build canvases across all episodes
     print("Building canvases...")
     canvas_count = 0
-    valid_start = config.CANVAS_HISTORY_SIZE - 1
+    history = config.CANVAS_HISTORY_SIZE
+    episode_indices = []
 
-    for frame_idx in tqdm(
-        range(valid_start, len(observations)),
-        desc="Building canvases",
-        total=len(observations) - valid_start,
-    ):
-        # Get frame indices for history
-        start_idx = frame_idx - (config.CANVAS_HISTORY_SIZE - 1)
+    for ep in episodes:
+        ep_canvas_start = canvas_count
+        valid_start = history - 1
 
-        # Get frames
-        frames = frame_images[start_idx : frame_idx + 1]
+        for frame_idx in tqdm(
+            range(valid_start, len(ep.frames)),
+            desc=f"Episode {ep.episode_index}",
+            total=len(ep.frames) - valid_start,
+        ):
+            start_idx = frame_idx - (history - 1)
 
-        # Get actions
-        frame_actions = []
-        for i in range(start_idx, frame_idx):
-            if i < len(actions):
-                frame_actions.append(actions[i]['action'])
-            else:
-                frame_actions.append({'action': 0})
+            # Collect frames and actions for this window
+            window_frames = ep.frames[start_idx : frame_idx + 1]
+            window_actions = ep.actions[start_idx : frame_idx]
 
-        # Build interleaved list
-        interleaved = []
-        for i in range(len(frames)):
-            interleaved.append(frames[i])
-            if i < len(frame_actions):
-                interleaved.append(frame_actions[i])
+            # Build interleaved list: [frame, action, frame, action, frame]
+            interleaved = []
+            for i in range(len(window_frames)):
+                interleaved.append(window_frames[i])
+                if i < len(window_actions):
+                    interleaved.append(window_actions[i])
 
-        # Build canvas
-        canvas = build_canvas(
-            interleaved,
-            frame_size=detected_frame_size,
-            sep_width=config.SEPARATOR_WIDTH,
-        )
+            canvas = build_canvas(
+                interleaved,
+                frame_size=detected_frame_size,
+                sep_width=config.SEPARATOR_WIDTH,
+            )
 
-        # Save canvas
-        canvas_filename = f"canvas_{canvas_count:05d}.png"
-        canvas_path = os.path.join(output_dir, canvas_filename)
-        Image.fromarray(canvas).save(canvas_path)
+            canvas_path = Path(output_dir) / f"canvas_{canvas_count:05d}.png"
+            Image.fromarray(canvas).save(canvas_path)
+            canvas_count += 1
 
-        canvas_count += 1
+        episode_indices.append({
+            "episode_index": ep.episode_index,
+            "canvas_start": ep_canvas_start,
+            "canvas_end": canvas_count - 1,
+            "frame_count": len(ep.frames),
+            "action_count": len(ep.actions),
+        })
 
     # Save dataset metadata
     dataset_meta = {
-        'session_name': meta.get('session_name', 'unknown'),
-        'frame_count': len(observations),
-        'canvas_count': canvas_count,
-        'frame_size': detected_frame_size,
-        'canvas_size': (
+        "source": "lerobot_v3",
+        "source_path": lerobot_path,
+        "canvas_count": canvas_count,
+        "frame_size": detected_frame_size,
+        "canvas_size": (
             detected_frame_size[0],
-            detected_frame_size[1] * config.CANVAS_HISTORY_SIZE
-            + config.SEPARATOR_WIDTH * (config.CANVAS_HISTORY_SIZE - 1),
+            detected_frame_size[1] * history + config.SEPARATOR_WIDTH * (history - 1),
         ),
-        'separator_width': config.SEPARATOR_WIDTH,
-        'canvas_history_size': config.CANVAS_HISTORY_SIZE,
-        'session_metadata': meta,
+        "separator_width": config.SEPARATOR_WIDTH,
+        "canvas_history_size": history,
+        "cameras": cameras,
+        "stack_mode": stack_mode,
+        "episodes": episode_indices,
     }
 
-    meta_path = os.path.join(output_dir, 'dataset_meta.json')
-    with open(meta_path, 'w') as f:
+    meta_path = Path(output_dir) / "dataset_meta.json"
+    with open(meta_path, "w") as f:
         json.dump(dataset_meta, f, indent=2)
 
-    print(f"\nDataset created successfully:")
-    print(f"  Output directory: {output_dir}")
-    print(f"  Total canvases: {canvas_count}")
+    print(f"\nDataset created:")
+    print(f"  Output: {output_dir}")
+    print(f"  Canvases: {canvas_count}")
     print(f"  Canvas size: {dataset_meta['canvas_size']}")
-    print(f"  Metadata saved to: {meta_path}")
+    print(f"  Episodes: {len(episode_indices)}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='Create a dataset by building all canvases from a session'
+        description="Create a canvas dataset from a LeRobot v3.0 dataset"
     )
     parser.add_argument(
-        '--session',
+        "--lerobot-path",
+        type=str,
         required=True,
-        help='Path to session directory',
+        help="Path to LeRobot v3.0 dataset or HuggingFace repo_id",
     )
     parser.add_argument(
-        '--output',
-        required=True,
-        help='Path to output dataset directory',
+        "--output",
+        type=str,
+        default="local/datasets",
+        help="Path to output dataset directory (default: local/datasets)",
+    )
+    parser.add_argument(
+        "--cameras",
+        type=str,
+        nargs="+",
+        default=config.DEFAULT_CAMERAS,
+        help="Camera keys to use",
+    )
+    parser.add_argument(
+        "--stack-cameras",
+        type=str,
+        choices=["vertical", "horizontal", "single"],
+        default=config.DEFAULT_STACK_MODE,
+        help="How to combine multiple cameras",
+    )
+    parser.add_argument(
+        "--frame-size",
+        type=int,
+        nargs=2,
+        default=list(config.DEFAULT_FRAME_SIZE),
+        help="Per-camera frame size (height width)",
+    )
+    parser.add_argument(
+        "--episode",
+        type=str,
+        default=None,
+        help="Episode index (int) or 'all' for all episodes. Default: all.",
     )
 
     args = parser.parse_args()
-    create_dataset(args.session, args.output)
+
+    # Parse episode argument
+    ep = None
+    if args.episode is not None and args.episode != "all":
+        ep = int(args.episode)
+
+    # Derive output subdirectory from lerobot path if using default output
+    output_dir = args.output
+    if output_dir == "local/datasets":
+        # e.g. "irvinh/single-action-shoulder-pan-500" -> "single-action-shoulder-pan-500"
+        dataset_name = args.lerobot_path.rstrip("/").split("/")[-1]
+        output_dir = str(Path(output_dir) / dataset_name)
+
+    create_dataset(
+        lerobot_path=args.lerobot_path,
+        output_dir=output_dir,
+        cameras=args.cameras,
+        stack_mode=args.stack_cameras,
+        frame_size=tuple(args.frame_size),
+        episode=ep,
+    )
