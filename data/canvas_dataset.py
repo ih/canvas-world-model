@@ -42,6 +42,9 @@ class CanvasDataset(Dataset):
         self.sep_width = self.meta["separator_width"]
         self.frame_h, self.frame_w = self.meta["frame_size"]
 
+        # Per-canvas action labels (may not exist in older datasets)
+        self.canvas_actions = self.meta.get("canvas_actions", None)
+
         # Build index list with split per episode
         # For single-canvas episodes, use episode index to deterministically assign
         self.indices = []
@@ -79,7 +82,11 @@ class CanvasDataset(Dataset):
             arr = arr * 2.0 - 1.0
 
         tensor = torch.from_numpy(arr).permute(2, 0, 1)  # [3, H, W]
-        return {"canvas": tensor, "index": canvas_idx}
+
+        result = {"canvas": tensor, "index": canvas_idx}
+        if self.canvas_actions is not None:
+            result["actions"] = self.canvas_actions[canvas_idx]
+        return result
 
 
 def extract_last_frame_region(canvas, num_frames, frame_w, sep_width):

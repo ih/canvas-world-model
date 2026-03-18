@@ -311,10 +311,13 @@ class EpisodeFrameActions:
     frames[i] is the i-th observation frame (H, W, 3) uint8.
     actions[i] is the discrete action taken between frames[i] and frames[i+1].
     len(actions) == len(frames) - 1
+    motor_positions[i] is the motor state vector at frames[i] (1D numpy array).
+    len(motor_positions) == len(frames), or empty if not available.
     """
 
     frames: list = field(default_factory=list)
     actions: list = field(default_factory=list)
+    motor_positions: list = field(default_factory=list)
     episode_index: int = 0
     metadata: dict = field(default_factory=dict)
 
@@ -328,6 +331,7 @@ def load_episode(
     cached_extractors: Optional[dict] = None,
     cached_logs: Optional[List] = None,
     cached_chunk_data: Optional[dict] = None,
+    state_column: Optional[str] = None,
 ) -> EpisodeFrameActions:
     """Load frames and discrete actions for one episode.
 
@@ -342,6 +346,7 @@ def load_episode(
         cached_extractors: Optional pre-loaded {(camera, chunk): VideoFrameExtractor}
         cached_logs: Optional pre-loaded list of DiscreteActionLog
         cached_chunk_data: Optional pre-loaded {chunk_idx: DataFrame}
+        state_column: Parquet column for motor positions (default: "observation.state")
 
     Returns:
         EpisodeFrameActions with frames and discrete actions
@@ -456,13 +461,16 @@ def load_episode(
 
     decision_frames = get_decision_frame_indices(action_log, total_video_frames)
 
-    # Trim trailing no-ops
+    # Trim leading and trailing no-ops
     original_count = len(decision_frames)
     while decision_frames and decision_frames[-1][1] == 0:
         decision_frames.pop()
+    while decision_frames and decision_frames[0][1] == 0:
+        decision_frames.pop(0)
 
-    if len(decision_frames) < original_count:
-        print(f"  Trimmed {original_count - len(decision_frames)} trailing no-op actions")
+    trimmed = original_count - len(decision_frames)
+    if trimmed:
+        print(f"  Trimmed {trimmed} no-op actions (leading + trailing)")
 
     if not decision_frames:
         if owns_extractors:
@@ -474,13 +482,60 @@ def load_episode(
     action_duration_frames = max(1, round(action_log.action_duration * reader.fps))
     max_frame = video_offset + length - 1
 
+    # Extract motor positions from parquet if available
+    state_key = state_column or "observation.state"
+    has_motor = state_key in episode_data.columns
+    if has_motor:
+        # Build a lookup from global frame index to state vector
+        if "index" in episode_data.columns:
+            idx_col = "index"
+        elif "frame_index" in episode_data.columns:
+            idx_col = "frame_index"
+        else:
+            idx_col = None
+
+        if idx_col is not None:
+            state_lookup = {}
+            for _, row in episode_data.iterrows():
+                gidx = int(row[idx_col])
+                state_val = row[state_key]
+                if isinstance(state_val, (list, np.ndarray)):
+                    state_lookup[gidx] = np.array(state_val, dtype=np.float32)
+                else:
+                    state_lookup[gidx] = np.array([float(state_val)], dtype=np.float32)
+        else:
+            # Fall back to positional indexing
+            state_lookup = {}
+            for i, (_, row) in enumerate(episode_data.iterrows()):
+                state_val = row[state_key]
+                if isinstance(state_val, (list, np.ndarray)):
+                    state_lookup[video_offset + i] = np.array(state_val, dtype=np.float32)
+                else:
+                    state_lookup[video_offset + i] = np.array([float(state_val)], dtype=np.float32)
+
+    def get_motor_state(global_frame_idx: int) -> Optional[np.ndarray]:
+        """Look up motor state for a global frame index, with nearest-neighbor fallback."""
+        if not has_motor:
+            return None
+        if global_frame_idx in state_lookup:
+            return state_lookup[global_frame_idx]
+        # Nearest available frame
+        available = list(state_lookup.keys())
+        if not available:
+            return None
+        nearest = min(available, key=lambda k: abs(k - global_frame_idx))
+        return state_lookup[nearest]
+
     frames = []
     actions = []
+    motor_positions = []
 
     # First frame: at the first decision point
-    first_frame = get_combined_frame(decision_frames[0][0] + video_offset)
+    first_global_idx = decision_frames[0][0] + video_offset
+    first_frame = get_combined_frame(first_global_idx)
     if first_frame is not None:
         frames.append(first_frame)
+        motor_positions.append(get_motor_state(first_global_idx))
 
     # For each decision, record the action and the result frame
     # The result frame is action_duration_frames after the decision
@@ -495,6 +550,7 @@ def load_episode(
         elif frames:
             # Use last valid frame as fallback
             frames.append(frames[-1].copy())
+        motor_positions.append(get_motor_state(result_frame_idx))
 
     # Only close extractors we own (not cached ones)
     if owns_extractors:
@@ -505,6 +561,20 @@ def load_episode(
     if len(actions) >= len(frames):
         actions = actions[: len(frames) - 1]
 
+    # Ensure motor_positions matches frames length
+    motor_positions = motor_positions[: len(frames)]
+
+    # Compute normalization bounds for motor positions
+    motor_bounds = None
+    valid_motors = [m for m in motor_positions if m is not None]
+    if valid_motors:
+        stacked = np.stack(valid_motors)
+        motor_bounds = {
+            "min": stacked.min(axis=0).tolist(),
+            "max": stacked.max(axis=0).tolist(),
+            "num_joints": int(stacked.shape[1]),
+        }
+
     metadata = {
         "fps": reader.fps,
         "cameras": cameras,
@@ -512,11 +582,13 @@ def load_episode(
         "frame_size": frame_size,
         "joint_name": action_log.joint_name,
         "source_path": str(reader.dataset_path),
+        "motor_bounds": motor_bounds,
     }
 
     return EpisodeFrameActions(
         frames=frames,
         actions=actions,
+        motor_positions=motor_positions,
         episode_index=episode_index,
         metadata=metadata,
     )
@@ -528,6 +600,7 @@ def load_dataset(
     stack_mode: str,
     frame_size: Tuple[int, int],
     episode: Optional[int] = None,
+    state_column: Optional[str] = None,
 ) -> List[EpisodeFrameActions]:
     """Load frames and actions from a LeRobot v3.0 dataset.
 
@@ -539,6 +612,7 @@ def load_dataset(
         stack_mode: How to combine cameras
         frame_size: Per-camera (H, W) resize target
         episode: Specific episode index, or None for all episodes
+        state_column: Parquet column for motor positions (default: "observation.state")
 
     Returns:
         List of EpisodeFrameActions, one per episode
@@ -575,6 +649,7 @@ def load_dataset(
             cached_extractors=cached_extractors,
             cached_logs=cached_logs,
             cached_chunk_data=cached_chunk_data,
+            state_column=state_column,
         )
         print(f"  {len(ep_data.frames)} frames, {len(ep_data.actions)} actions")
         results.append(ep_data)

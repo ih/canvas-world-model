@@ -106,6 +106,7 @@ def log_sample_predictions(model, val_loader, patch_mask, device, grid_h, grid_w
 def train_one_epoch(model, loader, optimizer, patch_mask, device, patch_size, epoch, num_epochs):
     model.train()
     total_loss = 0.0
+    total_grad_norm = 0.0
     num_batches = 0
 
     pbar = tqdm(loader, desc=f"Epoch {epoch}/{num_epochs} [train]", leave=False)
@@ -122,13 +123,20 @@ def train_one_epoch(model, loader, optimizer, patch_mask, device, patch_size, ep
 
         optimizer.zero_grad()
         loss.backward()
+
+        # Track gradient norm before optimizer step
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
+        total_grad_norm += grad_norm.item()
+
         optimizer.step()
 
         total_loss += loss.item()
         num_batches += 1
         pbar.set_postfix(loss=f"{loss.item():.6f}")
 
-    return total_loss / max(num_batches, 1)
+    avg_loss = total_loss / max(num_batches, 1)
+    avg_grad_norm = total_grad_norm / max(num_batches, 1)
+    return avg_loss, avg_grad_norm
 
 
 @torch.no_grad()
@@ -236,7 +244,7 @@ def main():
     epochs_without_improvement = 0
 
     for epoch in range(start_epoch, args.epochs):
-        train_loss = train_one_epoch(
+        train_loss, grad_norm = train_one_epoch(
             model, train_loader, optimizer, patch_mask, device,
             args.patch_size, epoch + 1, args.epochs,
         )
@@ -266,11 +274,14 @@ def main():
             else:
                 epochs_without_improvement += 1
 
+            train_val_gap = train_loss - val_loss
+
             # Console log
             print(
                 f"Epoch {epoch+1}/{args.epochs}: "
                 f"train_loss={train_loss:.6f}, val_loss={val_loss:.6f}, "
-                f"lr={current_lr:.2e}, best_val={best_val_loss:.6f}"
+                f"lr={current_lr:.2e}, best_val={best_val_loss:.6f}, "
+                f"grad_norm={grad_norm:.4f}, tv_gap={train_val_gap:.6f}"
             )
 
             # Wandb log
@@ -279,6 +290,8 @@ def main():
                     "train_loss": train_loss,
                     "val_loss": val_loss,
                     "lr": current_lr,
+                    "grad_norm": grad_norm,
+                    "train_val_gap": train_val_gap,
                     "epoch": epoch + 1,
                 }
                 wandb.log(log_dict, step=epoch + 1)
@@ -297,9 +310,9 @@ def main():
                 break
         else:
             current_lr = optimizer.param_groups[0]["lr"]
-            print(f"Epoch {epoch+1}/{args.epochs}: train_loss={train_loss:.6f}, lr={current_lr:.2e}")
+            print(f"Epoch {epoch+1}/{args.epochs}: train_loss={train_loss:.6f}, lr={current_lr:.2e}, grad_norm={grad_norm:.4f}")
             if wandb:
-                wandb.log({"train_loss": train_loss, "lr": current_lr, "epoch": epoch + 1}, step=epoch + 1)
+                wandb.log({"train_loss": train_loss, "lr": current_lr, "grad_norm": grad_norm, "epoch": epoch + 1}, step=epoch + 1)
 
     # Save final checkpoint
     save_checkpoint(

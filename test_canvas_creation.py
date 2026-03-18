@@ -167,6 +167,135 @@ class TestCanvasBuilding:
         assert sep[0, 0, 2] == 255  # Blue for action=2
 
 
+class TestMotorStrip:
+    def _make_frame(self, color, h=448, w=224):
+        frame = np.zeros((h, w, 3), dtype=np.uint8)
+        frame[:] = color
+        return frame
+
+    def test_canvas_with_motor_strip(self):
+        """Canvas height increases by motor_strip_height when motor positions are provided."""
+        frames = [self._make_frame((128, 128, 128)) for _ in range(2)]
+        interleaved = [frames[0], 0, frames[1]]
+
+        motor_pos = [
+            np.array([0.0, 0.5, 1.0], dtype=np.float32),
+            np.array([0.2, 0.7, 0.3], dtype=np.float32),
+        ]
+        norm_min = np.array([0.0, 0.0, 0.0])
+        norm_max = np.array([1.0, 1.0, 1.0])
+        vel_max = np.array([1.0, 1.0, 1.0])
+
+        canvas = build_canvas(
+            interleaved,
+            frame_size=(448, 224),
+            sep_width=32,
+            motor_positions=motor_pos,
+            motor_strip_height=16,
+            motor_norm_min=norm_min,
+            motor_norm_max=norm_max,
+            motor_vel_norm_max=vel_max,
+        )
+
+        expected_h = 448 + 16
+        expected_w = 224 * 2 + 32
+        assert canvas.shape == (expected_h, expected_w, 3)
+
+    def test_motor_strip_position_patches(self):
+        """Each joint's position patch should be a uniform grayscale fill."""
+        frames = [self._make_frame((0, 0, 0)) for _ in range(2)]
+        interleaved = [frames[0], 1, frames[1]]
+
+        # 2 joints: first at max, second at min
+        motor_pos = [
+            np.array([1.0, 0.0], dtype=np.float32),
+            np.array([0.5, 0.5], dtype=np.float32),
+        ]
+        norm_min = np.array([0.0, 0.0])
+        norm_max = np.array([1.0, 1.0])
+        vel_max = np.array([1.0, 1.0])
+
+        canvas = build_canvas(
+            interleaved,
+            frame_size=(448, 224),
+            sep_width=32,
+            motor_positions=motor_pos,
+            motor_strip_height=16,
+            motor_norm_min=norm_min,
+            motor_norm_max=norm_max,
+            motor_vel_norm_max=vel_max,
+        )
+
+        # First frame, patch 0 (joint 0 position=1.0) -> white
+        assert canvas[448, 0, 0] == 255
+        # First frame, patch 1 (joint 1 position=0.0) -> black
+        assert canvas[448, 16, 0] == 0
+
+    def test_motor_strip_velocity_patches(self):
+        """Velocity patches: first frame mid-gray (no prior), second frame reflects delta."""
+        frames = [self._make_frame((0, 0, 0)) for _ in range(2)]
+        interleaved = [frames[0], 1, frames[1]]
+
+        motor_pos = [
+            np.array([0.0], dtype=np.float32),
+            np.array([1.0], dtype=np.float32),  # delta = +1.0
+        ]
+        norm_min = np.array([0.0])
+        norm_max = np.array([1.0])
+        vel_max = np.array([1.0])
+
+        canvas = build_canvas(
+            interleaved,
+            frame_size=(448, 224),
+            sep_width=32,
+            motor_positions=motor_pos,
+            motor_strip_height=16,
+            motor_norm_min=norm_min,
+            motor_norm_max=norm_max,
+            motor_vel_norm_max=vel_max,
+        )
+
+        # First frame velocity patch (patch index 1, x=16:32): mid-gray (no prior frame)
+        assert canvas[448, 16, 0] == 128
+
+        # Second frame velocity patch (patch index 1, x=256+16=272): max positive -> white
+        assert canvas[448, 272, 0] == 255
+
+    def test_canvas_without_motor_unchanged(self):
+        """Canvas without motor positions should have original height."""
+        frames = [self._make_frame((128, 128, 128)) for _ in range(2)]
+        interleaved = [frames[0], 0, frames[1]]
+
+        canvas = build_canvas(interleaved, frame_size=(448, 224), sep_width=32)
+        assert canvas.shape == (448, 480, 3)
+
+    def test_separator_spans_full_height_with_motor(self):
+        """Separator should span the full canvas height including motor strip."""
+        frames = [self._make_frame((0, 0, 0)) for _ in range(2)]
+        interleaved = [frames[0], 1, frames[1]]
+
+        motor_pos = [np.array([0.5]), np.array([0.5])]
+        norm_min = np.array([0.0])
+        norm_max = np.array([1.0])
+        vel_max = np.array([1.0])
+
+        canvas = build_canvas(
+            interleaved,
+            frame_size=(448, 224),
+            sep_width=32,
+            motor_positions=motor_pos,
+            motor_strip_height=16,
+            motor_norm_min=norm_min,
+            motor_norm_max=norm_max,
+            motor_vel_norm_max=vel_max,
+        )
+
+        # Separator at x=224:256 should be green (action=1) across full height
+        sep = canvas[:, 224:256]
+        assert sep[0, 0, 1] == 255    # top: green
+        assert sep[460, 0, 1] == 255  # bottom (in motor strip region): green
+
+
 class TestEpisodeBoundary:
     def test_no_canvas_crossover(self):
         """Canvases should not span two episodes."""
