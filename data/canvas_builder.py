@@ -24,13 +24,15 @@ def _separator_color_for_action(action_dict: dict) -> tuple:
 
     # Standard action colors
     if action_int == 0:
-        return (255, 0, 0)    # Red: stay
+        return (255, 255, 0)  # Yellow: buffer
     elif action_int == 1:
         return (0, 255, 0)    # Green: move positive
     elif action_int == 2:
         return (0, 0, 255)    # Blue: move negative
+    elif action_int == 3:
+        return (255, 0, 0)    # Red: stay (no movement)
     else:
-        return (255, 255, 0)  # Yellow: unknown
+        return (128, 128, 128)  # Gray: unknown
 
 
 def _to_uint8(img: np.ndarray) -> np.ndarray:

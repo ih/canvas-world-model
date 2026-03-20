@@ -357,27 +357,69 @@ def run_inference(model, model_type, canvas, patch_mask, patch_size, grid_h, gri
 
     elif model_type == "diffusion":
         target_patches = patchify(canvas, patch_size)
-        noisy_patches = target_patches.clone()
-        noisy_patches[batch_mask] = torch.randn_like(noisy_patches[batch_mask])
-        current = unpatchify(noisy_patches, patch_size, grid_h, grid_w)
+        device = canvas.device
+        prediction_type = saved_args.get("prediction_type", "epsilon")
 
-        num_inference_steps = 50
-        step_size = noise_scheduler.num_train_timesteps // num_inference_steps
-        timesteps = list(range(noise_scheduler.num_train_timesteps - 1, -1, -step_size))
+        if prediction_type == "sample":
+            # For sample prediction: iterative x_0 refinement
+            # Start from pure noise for last frame
+            current_patches = target_patches.clone()
+            current_patches[batch_mask] = torch.randn_like(current_patches[batch_mask])
 
-        for t in timesteps:
-            t_batch = torch.full((B,), t, device=canvas.device, dtype=torch.long)
-            pred = model(current, t_batch)
+            num_inference_steps = 50
+            step_size = noise_scheduler.num_train_timesteps // num_inference_steps
+            timesteps = list(range(noise_scheduler.num_train_timesteps - 1, -1, -step_size))
 
-            current_patches = patchify(current, patch_size)
-            denoised_patches = current_patches.clone()
-            pred_last_frame = pred[batch_mask]
-            current_last_frame = current_patches[batch_mask]
-            stepped = noise_scheduler.step(pred_last_frame, t, current_last_frame)
-            denoised_patches[batch_mask] = stepped
-            current = unpatchify(denoised_patches, patch_size, grid_h, grid_w)
+            for t in timesteps:
+                current = unpatchify(current_patches, patch_size, grid_h, grid_w)
+                t_batch = torch.full((B,), t, device=device, dtype=torch.long)
+                pred = model(current, t_batch)
 
-        return current
+                # Model predicts clean x_0 directly
+                pred_x0 = pred[batch_mask]
+
+                if t > 0:
+                    # Re-noise to the next (lower) timestep level
+                    t_prev = max(t - step_size, 0)
+                    noise = torch.randn_like(pred_x0)
+                    t_prev_batch = torch.full((pred_x0.shape[0] // B,), t_prev, device=device, dtype=torch.long)
+                    # Use forward process to go from pred_x0 to x_{t_prev}
+                    alpha_bar_prev = noise_scheduler.alphas_cumprod.to(device)[t_prev]
+                    current_patches[batch_mask] = (
+                        torch.sqrt(alpha_bar_prev) * pred_x0 +
+                        torch.sqrt(1.0 - alpha_bar_prev) * noise
+                    )
+                else:
+                    # Final step: use prediction directly
+                    current_patches[batch_mask] = pred_x0
+
+            # Keep context patches from original
+            current_patches[~batch_mask.expand(B, -1)] = target_patches[~batch_mask.expand(B, -1)]
+            return unpatchify(current_patches, patch_size, grid_h, grid_w)
+
+        else:
+            # Epsilon prediction: standard DDIM
+            noisy_patches = target_patches.clone()
+            noisy_patches[batch_mask] = torch.randn_like(noisy_patches[batch_mask])
+            current = unpatchify(noisy_patches, patch_size, grid_h, grid_w)
+
+            num_inference_steps = 50
+            step_size = noise_scheduler.num_train_timesteps // num_inference_steps
+            timesteps = list(range(noise_scheduler.num_train_timesteps - 1, -1, -step_size))
+
+            for t in timesteps:
+                t_batch = torch.full((B,), t, device=device, dtype=torch.long)
+                pred = model(current, t_batch)
+
+                current_patches = patchify(current, patch_size)
+                denoised_patches = current_patches.clone()
+                pred_last_frame = pred[batch_mask]
+                current_last_frame = current_patches[batch_mask]
+                stepped = noise_scheduler.step(pred_last_frame, t, current_last_frame)
+                denoised_patches[batch_mask] = stepped
+                current = unpatchify(denoised_patches, patch_size, grid_h, grid_w)
+
+            return current
 
 
 def to_display_range(tensor, normalize_mode):
@@ -908,7 +950,8 @@ def save_counterfactual_images(counterfactual_results, output_dir, meta):
 # ---------------------------------------------------------------------------
 
 def generate_html_report(metrics, counterfactual_results, saved_images, output_dir,
-                         meta, model_type, checkpoint_path, dataset_path):
+                         meta, model_type, checkpoint_path, dataset_path,
+                         analysis_notes=None, run_name=None):
     """Generate a self-contained HTML evaluation report."""
     from PIL import Image
 
@@ -916,7 +959,8 @@ def generate_html_report(metrics, counterfactual_results, saved_images, output_d
     docs_dir = Path("docs")
     docs_dir.mkdir(parents=True, exist_ok=True)
 
-    html_path = docs_dir / f"eval_{model_type}_{timestamp}.html"
+    run_label = run_name or f"{model_type}_{timestamp}"
+    html_path = docs_dir / f"eval_{run_label.replace(' ', '_')}.html"
 
     # Color coding thresholds
     def metric_color(name, value):
@@ -990,8 +1034,9 @@ tr:nth-child(even) {{ background: #f9f9f9; }}
 </style>
 </head>
 <body>
-<h1>Evaluation Report: {model_type.upper()}</h1>
+<h1>Evaluation Report: {run_label}</h1>
 <div class="header-info">
+<p><strong>Run Name:</strong> {run_label}</p>
 <p><strong>Model Type:</strong> {model_type}</p>
 <p><strong>Checkpoint:</strong> {checkpoint_path}</p>
 <p><strong>Dataset:</strong> {dataset_path}</p>
@@ -999,6 +1044,13 @@ tr:nth-child(even) {{ background: #f9f9f9; }}
 <p><strong>Val Samples:</strong> {metrics.get('num_val_samples', 'N/A')}</p>
 </div>
 """)
+
+    # Analysis notes section
+    if analysis_notes:
+        html_parts.append('<h2>Analysis Notes</h2>\n')
+        html_parts.append('<div style="background:#e8f4fd;border-left:4px solid #3498db;padding:16px;margin:15px 0;border-radius:4px;white-space:pre-wrap;font-family:sans-serif;line-height:1.6;">')
+        html_parts.append(analysis_notes.replace('<', '&lt;').replace('>', '&gt;'))
+        html_parts.append('</div>\n')
 
     # Metrics table
     html_parts.append("<h2>Metrics</h2>\n<table>\n<tr><th>Metric</th><th>Value</th></tr>\n")
@@ -1135,6 +1187,10 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--no-html", action="store_true", help="Skip HTML report generation")
+    p.add_argument("--analysis-notes", type=str, default=None,
+                   help="Path to a text file with analysis notes to include in HTML report")
+    p.add_argument("--run-name", type=str, default=None,
+                   help="Name for this experiment run (shown in report header)")
     return p.parse_args()
 
 
@@ -1248,9 +1304,18 @@ def main():
     # --- HTML report ---
     if not args.no_html:
         print("\nGenerating HTML report...")
+        notes_text = None
+        if args.analysis_notes:
+            notes_path = Path(args.analysis_notes)
+            if notes_path.exists():
+                notes_text = notes_path.read_text(encoding="utf-8")
+            else:
+                notes_text = args.analysis_notes  # treat as inline text
+
         html_path = generate_html_report(
             serializable_metrics, counterfactual_results, saved_images,
             output_dir, meta, args.model_type, args.checkpoint, args.dataset,
+            analysis_notes=notes_text, run_name=args.run_name,
         )
         print(f"HTML report: {html_path}")
 

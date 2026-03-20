@@ -52,6 +52,9 @@ def parse_args():
     p.add_argument("--patience", type=int, default=5, help="Plateau patience (epochs)")
     p.add_argument("--lr-factor", type=float, default=0.5, help="LR reduction factor")
     p.add_argument("--min-lr", type=float, default=1e-6)
+    p.add_argument("--lr-schedule", type=str, default="plateau", choices=["plateau", "cosine"],
+                   help="LR schedule type: plateau (default) or cosine with warmup")
+    p.add_argument("--warmup-epochs", type=int, default=5, help="Warmup epochs for cosine schedule")
 
     # Model
     p.add_argument("--patch-size", type=int, default=16)
@@ -219,7 +222,15 @@ def main():
 
     # --- Optimizer + Scheduler ---
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = create_plateau_scheduler(optimizer, patience=args.patience, factor=args.lr_factor, min_lr=args.min_lr)
+    if args.lr_schedule == "cosine":
+        from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+        warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=args.warmup_epochs)
+        cosine_scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs - args.warmup_epochs, eta_min=args.min_lr)
+        scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[args.warmup_epochs])
+        use_cosine = True
+    else:
+        scheduler = create_plateau_scheduler(optimizer, patience=args.patience, factor=args.lr_factor, min_lr=args.min_lr)
+        use_cosine = False
 
     # --- Resume ---
     start_epoch = 0
@@ -258,7 +269,10 @@ def main():
         val_loss = None
         if (epoch + 1) % args.val_every == 0 or epoch == args.epochs - 1:
             val_loss = validate(model, val_loader, patch_mask, device, args.patch_size)
-            scheduler.step(val_loss)
+            if use_cosine:
+                scheduler.step()
+            else:
+                scheduler.step(val_loss)
 
             # Check for LR change
             current_lr = optimizer.param_groups[0]["lr"]
@@ -314,6 +328,8 @@ def main():
                 print(f"\nEarly stopping at epoch {epoch+1}: no val improvement for {args.early_stop_patience} epochs")
                 break
         else:
+            if use_cosine:
+                scheduler.step()
             current_lr = optimizer.param_groups[0]["lr"]
             print(f"Epoch {epoch+1}/{args.epochs}: train_loss={train_loss:.6f}, lr={current_lr:.2e}, grad_norm={grad_norm:.4f}")
             if wandb:

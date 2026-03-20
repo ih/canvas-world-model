@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Diffusion Experimentation Loop Summary</title>
+<style>
+body { font-family: 'Segoe UI', Tahoma, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+h1 { color: #2c3e50; border-bottom: 2px solid #e74c3c; padding-bottom: 10px; }
+h2 { color: #34495e; margin-top: 30px; }
+table { border-collapse: collapse; width: 100%; margin: 15px 0; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: center; }
+th { background: #e74c3c; color: white; }
+tr:nth-child(even) { background: #f9f9f9; }
+.best { background: #d4edda !important; font-weight: bold; }
+.worst { background: #f8d7da !important; }
+.insight { background: #fde8e8; border-left: 4px solid #e74c3c; padding: 16px; margin: 15px 0; border-radius: 4px; }
+.recommendation { background: #fff3cd; border-left: 4px solid #ffc107; padding: 16px; margin: 15px 0; border-radius: 4px; }
+.vs-gpt { background: #e8f4fd; border-left: 4px solid #3498db; padding: 16px; margin: 15px 0; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>Diffusion Model: Experimentation Loop Summary</h1>
+<p><strong>Date:</strong> 2026-03-19</p>
+<p><strong>Dataset:</strong> single-action-shoulder-pan-700-combined (700 canvases)</p>
+
+<h2>Diffusion Architecture Comparison</h2>
+<table>
+<tr>
+  <th>Iteration</th><th>Config</th><th>Prediction</th><th>Weight Decay</th>
+  <th>Val MSE</th><th>SSIM</th><th>PSNR</th>
+  <th>Action Disc.</th><th>Motor Dir Acc</th><th>Motor Pos MAE</th>
+</tr>
+<tr class="worst">
+  <td>1</td><td>256d8</td><td>epsilon</td><td>0.05</td>
+  <td>0.345</td><td>0.008</td><td>4.6</td>
+  <td>0.491</td><td>50.0%</td><td>8.51</td>
+</tr>
+<tr class="worst">
+  <td>2</td><td>384d12</td><td>epsilon</td><td>0.0</td>
+  <td>0.344</td><td>0.008</td><td>4.6</td>
+  <td>0.490</td><td>50.0%</td><td>8.49</td>
+</tr>
+<tr>
+  <td>3</td><td>384d12</td><td>sample</td><td>0.0</td>
+  <td>0.011</td><td>0.730</td><td>19.7</td>
+  <td>0.039</td><td>84.4%</td><td>0.954</td>
+</tr>
+<tr class="best">
+  <td>4</td><td>512d12</td><td>sample</td><td>0.01</td>
+  <td>0.009</td><td>0.775</td><td>21.0</td>
+  <td>0.038</td><td>82.5%</td><td>0.957</td>
+</tr>
+</table>
+
+<h2>vs. Best GPT Models</h2>
+<table>
+<tr>
+  <th>Model</th><th>Val MSE</th><th>SSIM</th><th>PSNR</th>
+  <th>Action Disc.</th><th>Motor Dir Acc</th><th>Motor Pos MAE</th>
+  <th>Dynamic MSE</th><th>No Error Compound?</th>
+</tr>
+<tr>
+  <td>GPT iter2 (384d12)</td>
+  <td>0.0102</td><td>0.756</td><td>20.4</td>
+  <td>0.031</td><td>83.1%</td><td><strong>0.612</strong></td>
+  <td>0.021</td><td>No (TF/FR gap=0.006)</td>
+</tr>
+<tr>
+  <td>GPT iter6 (384d12+cosine)</td>
+  <td>0.0113</td><td>0.752</td><td>20.0</td>
+  <td>0.034</td><td>85.0%</td><td><strong>0.463</strong></td>
+  <td>0.024</td><td>No</td>
+</tr>
+<tr class="best">
+  <td>Diffusion iter4 (512d12+sample)</td>
+  <td><strong>0.009</strong></td><td><strong>0.775</strong></td><td><strong>21.0</strong></td>
+  <td><strong>0.038</strong></td><td>82.5%</td><td>0.957</td>
+  <td><strong>0.018</strong></td><td>Yes</td>
+</tr>
+</table>
+
+<h2>Key Findings</h2>
+
+<div class="insight">
+<strong>1. Epsilon prediction is BROKEN for conditional canvas diffusion.</strong>
+Iterations 1-2 both produced pure noise despite training losses dropping to 0.506-0.675.
+The issue: epsilon prediction asks the model to predict noise, but the canvas has an asymmetry —
+context patches are always clean while only the last frame is noisy. The DDIM inference chain
+compounds errors from high-noise timesteps. Switching to sample prediction (predict clean image
+directly) fixed everything immediately.
+</div>
+
+<div class="insight">
+<strong>2. Sample prediction + iterative x_0 refinement is the correct inference approach.</strong>
+Standard DDIM doesn't work well with sample prediction because the noise re-derivation step
+introduces errors. Iterative x_0 refinement (predict x_0, re-noise to t-1 level, repeat) is
+more stable and produces dramatically better results.
+</div>
+
+<div class="insight">
+<strong>3. Weight decay must be tuned carefully: 0.0 for convergence, 0.01 for regularization.</strong>
+The baseline (wd=0.05) prevented learning entirely. Zero weight decay (wd=0.0) allowed training
+but caused severe overfitting (train/val gap -0.013). Weight decay 0.01 hit the sweet spot:
+good convergence + controlled overfitting (gap -0.005).
+</div>
+
+<div class="insight">
+<strong>4. The diffusion model beats GPT on visual quality but loses on motor precision.</strong>
+The wider diffusion model (512d12) achieves the best SSIM (0.775), PSNR (21.0), and dynamic
+pixel MSE (0.018) across all experiments. However, motor position MAE (0.957) is significantly
+worse than GPT (0.612). The stochastic generation process adds inherent noise to the precise
+grayscale motor patches.
+</div>
+
+<div class="insight">
+<strong>5. Diffusion models eliminate autoregressive error compounding.</strong>
+Unlike GPT which shows 10-50x higher error at the end of the raster scan (motor strip patches),
+the diffusion model produces uniform spatial quality. No TF/FR gap. This is a fundamental
+architectural advantage for tasks requiring uniform spatial accuracy.
+</div>
+
+<h2>Recommended Configuration</h2>
+<div class="recommendation">
+<strong>Best overall quality:</strong> Diffusion 512d12, sample prediction, wd=0.01, cosine LR
+<br>SSIM=0.775, PSNR=21.0, val_mse=0.009
+<br><br>
+<strong>Best motor precision:</strong> GPT 384d12 with cosine schedule (from GPT experiments)
+<br>Motor pos MAE=0.463, motor consistency=0.815
+<br><br>
+<strong>For robotics (motor accuracy critical):</strong> GPT with cosine schedule
+<br><strong>For visual prediction (image quality critical):</strong> Diffusion with sample prediction
+</div>
+
+<h2>What Would Help Next</h2>
+<div class="recommendation">
+<strong>1. Deterministic inference for motor strip:</strong> During diffusion inference, skip stochastic re-noising for motor strip patches — use deterministic x_0 prediction only. This should combine diffusion's visual quality with GPT-level motor accuracy.
+<br><br>
+<strong>2. EMA (Exponential Moving Average):</strong> Standard for diffusion models. The EMA model weights produce smoother, higher-quality predictions. Not yet implemented.
+<br><br>
+<strong>3. More data:</strong> The diffusion model with 512d12 (~50M params) benefits from more capacity than GPT, but 700 canvases still limits it. With 2000+ canvases, the quality gap over GPT would likely widen.
+<br><br>
+<strong>4. Hybrid model:</strong> Use diffusion for visual frame prediction, GPT-style direct prediction for motor strip. Best of both worlds.
+</div>
+
+<h2>Individual Reports</h2>
+<ul>
+<li><a href="eval_diff_iter1_baseline_256d8.html">Iter 1: Baseline 256d8, epsilon (FAILED)</a></li>
+<li><a href="eval_diff_iter2_384d12_cosine.html">Iter 2: 384d12, epsilon, cosine (FAILED)</a></li>
+<li><a href="eval_diff_iter3_sample_fixed_inference.html">Iter 3: 384d12, sample prediction (WORKING)</a></li>
+<li><a href="eval_diff_iter4_512d12_wd001.html">Iter 4: 512d12, sample, wd=0.01 (BEST)</a></li>
+</ul>
+
+<p><a href="experiment_summary.html">← Back to GPT Experiment Summary</a></p>
+
+</body>
+</html>

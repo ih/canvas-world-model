@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Experimentation Loop Summary</title>
+<style>
+body { font-family: 'Segoe UI', Tahoma, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+h1 { color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }
+h2 { color: #34495e; margin-top: 30px; }
+table { border-collapse: collapse; width: 100%; margin: 15px 0; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: center; }
+th { background: #3498db; color: white; }
+tr:nth-child(even) { background: #f9f9f9; }
+.best { background: #d4edda !important; font-weight: bold; }
+.worst { background: #f8d7da !important; }
+.insight { background: #e8f4fd; border-left: 4px solid #3498db; padding: 16px; margin: 15px 0; border-radius: 4px; }
+.recommendation { background: #fff3cd; border-left: 4px solid #ffc107; padding: 16px; margin: 15px 0; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>Canvas World Model: Experimentation Loop Summary</h1>
+<p><strong>Date:</strong> 2026-03-18</p>
+<p><strong>Dataset:</strong> single-action-shoulder-pan-700-combined (700 canvases, 464x480, 6-joint motor strip)</p>
+<p><strong>Goal:</strong> Action-conditioned next-frame prediction for robotics</p>
+
+<h2>Architecture Comparison Table</h2>
+<table>
+<tr>
+  <th>Iteration</th><th>Model</th><th>Params</th><th>Config</th>
+  <th>Val MSE</th><th>SSIM</th><th>PSNR</th>
+  <th>Action Disc.</th><th>Motor Dir Acc</th><th>Motor Pos MAE</th>
+  <th>Motor Consistency</th><th>TF/FR Gap</th>
+</tr>
+<tr>
+  <td>1</td><td>GPT</td><td>6.9M</td><td>256d8</td>
+  <td>0.0127</td><td>0.697</td><td>19.4</td>
+  <td>0.030</td><td>86.9%</td><td>0.877</td>
+  <td>1.170</td><td>0.007</td>
+</tr>
+<tr class="best">
+  <td>2</td><td>GPT</td><td>22M</td><td>384d12</td>
+  <td>0.0102</td><td>0.756</td><td>20.4</td>
+  <td>0.031</td><td>83.1%</td><td>0.612</td>
+  <td>1.007</td><td>0.006</td>
+</tr>
+<tr class="worst">
+  <td>3</td><td>MAE</td><td>~15M</td><td>384d8</td>
+  <td>0.0147</td><td>0.616</td><td>19.1</td>
+  <td>0.022</td><td>80.6%</td><td>1.696</td>
+  <td>1.946</td><td>N/A</td>
+</tr>
+<tr>
+  <td>4</td><td>GPT</td><td>29M</td><td>384d16</td>
+  <td>0.0133</td><td>0.730</td><td>19.4</td>
+  <td>0.034</td><td>83.1%</td><td>0.789</td>
+  <td>1.087</td><td>0.009</td>
+</tr>
+<tr>
+  <td>5</td><td>GPT</td><td>38M</td><td>512d12</td>
+  <td>0.0110</td><td>0.746</td><td>20.1</td>
+  <td>0.032</td><td>87.5%</td><td>0.615</td>
+  <td>1.037</td><td>0.007</td>
+</tr>
+<tr class="best">
+  <td>6</td><td>GPT</td><td>22M</td><td>384d12+cosine</td>
+  <td>0.0113</td><td>0.752</td><td>20.0</td>
+  <td>0.034</td><td>85.0%</td><td>0.463</td>
+  <td>0.815</td><td>0.007</td>
+</tr>
+</table>
+
+<h2>Key Findings</h2>
+
+<div class="insight">
+<strong>1. GPT dominates MAE for this task.</strong>
+The autoregressive approach (GPT) outperformed the masked reconstruction approach (MAE) on every metric, despite GPT's error compounding issue. The sequential patch dependencies provide crucial context for coherent prediction. MAE's parallel reconstruction produces blurrier, less accurate results.
+</div>
+
+<div class="insight">
+<strong>2. Model capacity has a sweet spot at ~22M params for 700 samples.</strong>
+Going from 6.9M to 22M (iter1→iter2) improved all metrics substantially. Going beyond 22M (iter4: 29M, iter5: 38M) provided no benefit — the models started overfitting more without improving generalization. This follows standard scaling law behavior: model size should match data size.
+</div>
+
+<div class="insight">
+<strong>3. Depth scaling hurts more than width scaling.</strong>
+Adding more transformer layers (12→16) worsened the TF/FR gap from 0.006 to 0.009, amplifying autoregressive error compounding. Width scaling (384→512) was neutral. For autoregressive models, shallower-and-wider is preferable.
+</div>
+
+<div class="insight">
+<strong>4. Cosine schedule excels at motor strip precision.</strong>
+The cosine schedule with warmup (iter6) achieved the best motor position MAE (0.463, 24% better than plateau) and motor consistency (0.815, 19% better). The smooth LR decay allows fine-tuning of precise grayscale values in the motor strip encoding. For robotics applications where motor state accuracy matters, cosine schedule is recommended.
+</div>
+
+<div class="insight">
+<strong>5. Autoregressive error compounding is the dominant limitation.</strong>
+Across all GPT iterations, the TF/FR gap remained 0.006-0.009, and per-position loss showed 10-50x increase at the end of the raster scan (motor strip). This is a fundamental architectural limitation that cannot be solved by scaling or schedule changes.
+</div>
+
+<div class="insight">
+<strong>6. Action discrimination is consistently positive but modest.</strong>
+All models achieved action discrimination scores of 0.022-0.034, confirming they learn to respond to different action separator colors. However, the scores are low in absolute terms. The dataset has only 2 action types (move+ and move-) with no "stay" actions, limiting diversity.
+</div>
+
+<h2>Recommended Configuration</h2>
+<div class="recommendation">
+<strong>Best overall visual quality:</strong> GPT 384d12 with ReduceLROnPlateau (iter2)
+<br>SSIM=0.756, PSNR=20.4, val_mse=0.0102
+<br><br>
+<strong>Best motor state prediction:</strong> GPT 384d12 with cosine schedule (iter6)
+<br>Motor pos MAE=0.463, motor consistency=0.815, motor dir acc=85%
+<br><br>
+<strong>For robotics use (where motor accuracy matters most):</strong> iter6 (cosine schedule)
+</div>
+
+<h2>What Would Help Next (not tried)</h2>
+<div class="recommendation">
+<strong>1. More data (highest priority):</strong> 700 canvases limits model capacity to ~22M params. With 2000-5000 canvases, the 38M+ models should start to shine.
+<br><br>
+<strong>2. Scheduled sampling:</strong> During training, randomly replace teacher-forced patches with model predictions. Would directly address the TF/FR gap (0.006-0.009) without changing architecture.
+<br><br>
+<strong>3. Bidirectional refinement:</strong> After GPT autoregressive pass, add a bidirectional refinement pass (like a denoising step) to correct accumulated errors in later patches.
+<br><br>
+<strong>4. Hybrid approach:</strong> Use MAE for the visual frame region (parallel prediction) but GPT-style autoregressive prediction for the motor strip (which is sequential in nature). Best of both worlds.
+<br><br>
+<strong>5. Action diversity:</strong> Add "stay" (action=0) samples to the dataset. Current data only has move+ and move-, limiting what the model can learn about action effects.
+<br><br>
+<strong>6. Perceptual loss:</strong> Add LPIPS or VGG perceptual loss term alongside MSE. Would improve visual quality (SSIM/PSNR) by penalizing blurriness rather than just pixel error.
+</div>
+
+<h2>Individual Reports</h2>
+<ul>
+<li><a href="eval_iter1_baseline_gpt_700.html">Iteration 1: Baseline GPT 256d8</a></li>
+<li><a href="eval_iter2_larger_gpt_384d12.html">Iteration 2: GPT 384d12 (BEST visual)</a></li>
+<li><a href="eval_iter3_mae_384d8.html">Iteration 3: MAE 384d8</a></li>
+<li><a href="eval_iter4_gpt_384d16_lowlr.html">Iteration 4: GPT 384d16</a></li>
+<li><a href="eval_iter5_gpt_512d12_wider.html">Iteration 5: GPT 512d12</a></li>
+<li><a href="eval_iter6_gpt_384d12_cosine.html">Iteration 6: GPT 384d12 + cosine (BEST motor)</a></li>
+</ul>
+
+</body>
+</html>
