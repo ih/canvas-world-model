@@ -10,6 +10,7 @@ Usage:
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -70,6 +71,8 @@ def parse_args():
     # Checkpointing
     p.add_argument("--checkpoint-dir", type=str, default="local/checkpoints/diffusion")
     p.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    p.add_argument("--fine-tune", type=str, default=None,
+                   help="Path to checkpoint for fine-tuning (loads weights only, fresh optimizer)")
 
     # Logging
     p.add_argument("--wandb-project", type=str, default="canvas-world-model")
@@ -296,10 +299,17 @@ def main():
         scheduler = create_plateau_scheduler(optimizer, patience=args.patience, factor=args.lr_factor, min_lr=args.min_lr)
         use_cosine = False
 
-    # --- Resume ---
+    # --- Fine-tune or Resume ---
     start_epoch = 0
     best_val_loss = float("inf")
-    if args.resume:
+    if args.fine_tune and args.resume:
+        print("Error: --fine-tune and --resume are mutually exclusive")
+        sys.exit(1)
+    if args.fine_tune:
+        ckpt = torch.load(args.fine_tune, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        print(f"Fine-tuning from: {args.fine_tune} (weights only, fresh optimizer)")
+    elif args.resume:
         start_epoch, best_val_loss = load_checkpoint(args.resume, model, optimizer, scheduler, device)
         start_epoch += 1
         print(f"Resumed from epoch {start_epoch}, best val loss: {best_val_loss:.6f}")
@@ -322,8 +332,14 @@ def main():
     print(f"\nStarting training for {args.epochs} epochs...")
     prev_lr = optimizer.param_groups[0]["lr"]
     epochs_without_improvement = 0
+    training_start = time.time()
+    epoch_times = []
+    val_loss_history = []
+    train_loss_history = []
+    best_epoch = 0
 
     for epoch in range(start_epoch, args.epochs):
+        epoch_start = time.time()
         train_loss, grad_norm = train_one_epoch(
             model, train_loader, optimizer, noise_scheduler, patch_mask, device,
             args.patch_size, args.num_train_timesteps, args.prediction_type,
@@ -349,9 +365,14 @@ def main():
                 print(f"  >> LR reduced: {prev_lr:.2e} -> {current_lr:.2e}")
             prev_lr = current_lr
 
+            # Track history
+            val_loss_history.append(val_loss)
+            train_loss_history.append(train_loss)
+
             # Save best
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                best_epoch = epoch + 1
                 epochs_without_improvement = 0
                 save_checkpoint(
                     model, optimizer, scheduler, epoch, val_loss,
@@ -388,6 +409,7 @@ def main():
                     )
 
             # Early stopping
+            epoch_times.append(time.time() - epoch_start)
             if args.early_stop_patience > 0 and epochs_without_improvement >= args.early_stop_patience:
                 print(f"\nEarly stopping at epoch {epoch+1}: no val improvement for {args.early_stop_patience} epochs")
                 break
@@ -398,14 +420,35 @@ def main():
             print(f"Epoch {epoch+1}/{args.epochs}: train_loss={train_loss:.6f}, lr={current_lr:.2e}, grad_norm={grad_norm:.4f}")
             if wandb:
                 wandb.log({"train_loss": train_loss, "lr": current_lr, "grad_norm": grad_norm, "epoch": epoch + 1}, step=epoch + 1)
+            train_loss_history.append(train_loss)
+            epoch_times.append(time.time() - epoch_start)
 
     # Save final
+    total_training_time = time.time() - training_start
     save_checkpoint(
         model, optimizer, scheduler, args.epochs - 1, best_val_loss,
         Path(args.checkpoint_dir) / "final.pth",
         extra={"args": vars(args)},
     )
-    print(f"\nTraining complete. Best val loss: {best_val_loss:.6f}")
+
+    # Save timing and loss history
+    timing = {
+        "total_training_seconds": total_training_time,
+        "avg_seconds_per_epoch": sum(epoch_times) / len(epoch_times) if epoch_times else 0,
+        "best_epoch": best_epoch,
+        "time_to_plateau_seconds": sum(epoch_times[:best_epoch]) if epoch_times and best_epoch > 0 else 0,
+        "num_epochs_run": len(epoch_times),
+        "epoch_times": epoch_times,
+        "val_loss_history": val_loss_history,
+        "train_loss_history": train_loss_history,
+        "best_val_loss": best_val_loss,
+    }
+    timing_path = Path(args.checkpoint_dir) / "timing.json"
+    with open(timing_path, "w") as f:
+        json.dump(timing, f, indent=2)
+
+    print(f"\nTraining complete. Best val loss: {best_val_loss:.6f} (epoch {best_epoch})")
+    print(f"Total training time: {total_training_time/60:.1f} minutes")
     print(f"Checkpoints saved to: {args.checkpoint_dir}")
 
     if wandb:
