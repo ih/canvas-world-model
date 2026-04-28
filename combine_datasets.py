@@ -12,8 +12,21 @@ from pathlib import Path
 import numpy as np
 
 
-def combine_datasets(input_dirs: list, output_dir: str) -> None:
-    """Merge multiple canvas datasets by copying canvases and merging metadata."""
+def combine_datasets(
+    input_dirs: list,
+    output_dir: str,
+    motor_bounds_override: dict | None = None,
+) -> None:
+    """Merge multiple canvas datasets by copying canvases and merging metadata.
+
+    `motor_bounds_override`, if provided, pins the output meta's
+    `motor_norm_min` / `motor_norm_max` to fixed values instead of deriving
+    them from the per-input global min/max. Keys: `motor_norm_min` (list of
+    6 floats), `motor_norm_max` (list of 6 floats), `motor_vel_norm_max`
+    (list of 6 floats, optional). Use this to keep the motor-strip
+    rendering stable across incremental merges so a checkpoint trained on
+    merge N doesn't see a shifted motor-strip distribution in merge N+1.
+    """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -32,6 +45,13 @@ def combine_datasets(input_dirs: list, output_dir: str) -> None:
     canvas_count = 0
     all_episodes = []
     all_canvas_actions = []
+    # Per-canvas acting joint + motor state at decision frame (added in
+    # the per-cell MSE breakdown work — sub-phase 1). evaluate.py uses
+    # these to bucket prediction error by (joint, position-bin). We must
+    # propagate them across merges or merged training datasets lose the
+    # signal even when each input dataset has it.
+    all_canvas_acting_joints: list = []
+    all_canvas_motor_states: list = []
     source_datasets = []
 
     # Collect all motor norm values across datasets to compute global bounds
@@ -69,16 +89,41 @@ def combine_datasets(input_dirs: list, output_dir: str) -> None:
         if meta.get("canvas_actions"):
             all_canvas_actions.extend(meta["canvas_actions"])
 
+        # Forward per-canvas joint + motor state. Pad with None when an
+        # individual source dataset lacks the fields (older builds), so
+        # the parallel arrays stay aligned with canvas indices.
+        n_canvases_in_meta = int(meta["canvas_count"])
+        src_joints = meta.get("canvas_acting_joints") or []
+        src_states = meta.get("canvas_motor_states_at_decision") or []
+        if len(src_joints) == n_canvases_in_meta:
+            all_canvas_acting_joints.extend(src_joints)
+        else:
+            all_canvas_acting_joints.extend([None] * n_canvases_in_meta)
+        if len(src_states) == n_canvases_in_meta:
+            all_canvas_motor_states.extend(src_states)
+        else:
+            all_canvas_motor_states.extend([None] * n_canvases_in_meta)
+
         source_datasets.append({
             "source_path": meta.get("source_path", str(dir_path)),
             "canvas_count": meta["canvas_count"],
             "canvas_offset": dataset_start,
         })
 
-    # Compute global motor bounds
-    global_motor_min = np.minimum.reduce(all_motor_mins).tolist() if all_motor_mins else None
-    global_motor_max = np.maximum.reduce(all_motor_maxs).tolist() if all_motor_maxs else None
-    global_vel_max = np.maximum.reduce(all_vel_maxs).tolist() if all_vel_maxs else None
+    # Compute global motor bounds — data-driven by default, overridden if
+    # the caller pinned them (for cross-merge comparability).
+    if motor_bounds_override and motor_bounds_override.get("motor_norm_min") is not None:
+        global_motor_min = list(motor_bounds_override["motor_norm_min"])
+    else:
+        global_motor_min = np.minimum.reduce(all_motor_mins).tolist() if all_motor_mins else None
+    if motor_bounds_override and motor_bounds_override.get("motor_norm_max") is not None:
+        global_motor_max = list(motor_bounds_override["motor_norm_max"])
+    else:
+        global_motor_max = np.maximum.reduce(all_motor_maxs).tolist() if all_motor_maxs else None
+    if motor_bounds_override and motor_bounds_override.get("motor_vel_norm_max") is not None:
+        global_vel_max = list(motor_bounds_override["motor_vel_norm_max"])
+    else:
+        global_vel_max = np.maximum.reduce(all_vel_maxs).tolist() if all_vel_maxs else None
 
     ref = all_metas[0]
     combined_meta = {
@@ -97,6 +142,12 @@ def combine_datasets(input_dirs: list, output_dir: str) -> None:
         "motor_vel_norm_max": global_vel_max,
         "episodes": all_episodes,
         "canvas_actions": all_canvas_actions if all_canvas_actions else None,
+        "canvas_acting_joints": (
+            all_canvas_acting_joints if any(j is not None for j in all_canvas_acting_joints) else None
+        ),
+        "canvas_motor_states_at_decision": (
+            all_canvas_motor_states if any(s is not None for s in all_canvas_motor_states) else None
+        ),
     }
 
     with open(out / "dataset_meta.json", "w") as f:
@@ -113,5 +164,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Combine multiple canvas datasets")
     parser.add_argument("--inputs", nargs="+", required=True, help="Input dataset directories")
     parser.add_argument("--output", required=True, help="Output combined dataset directory")
+    parser.add_argument(
+        "--motor-bounds-json",
+        default=None,
+        help=(
+            "Optional JSON dict pinning motor-strip normalization bounds. "
+            'Example: \'{"motor_norm_min":[-60,0,0,-90,-90,-45],'
+            '"motor_norm_max":[60,180,180,90,90,45]}\'. '
+            "If omitted, bounds are derived from the input datasets."
+        ),
+    )
     args = parser.parse_args()
-    combine_datasets(args.inputs, args.output)
+    override = json.loads(args.motor_bounds_json) if args.motor_bounds_json else None
+    combine_datasets(args.inputs, args.output, motor_bounds_override=override)
