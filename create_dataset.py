@@ -26,6 +26,7 @@ def create_dataset(
     frame_size: tuple,
     episode: int = None,
     state_column: str = None,
+    motor_bounds_override: dict = None,
 ) -> None:
     """Build all canvases from a LeRobot dataset and save as PNGs.
 
@@ -74,9 +75,20 @@ def create_dataset(
                     all_motors.append(m)
         if all_motors:
             stacked = np.stack(all_motors)
-            motor_norm_min = stacked.min(axis=0)
-            motor_norm_max = stacked.max(axis=0)
             motor_strip_height = config.MOTOR_STRIP_HEIGHT
+
+            # If an override is supplied, pin normalization bounds there so
+            # the motor-strip rendering stays stable across incremental
+            # canvas builds. Otherwise derive from the episodes' actual
+            # observed ranges.
+            if motor_bounds_override and motor_bounds_override.get("motor_norm_min") is not None:
+                motor_norm_min = np.array(motor_bounds_override["motor_norm_min"])
+            else:
+                motor_norm_min = stacked.min(axis=0)
+            if motor_bounds_override and motor_bounds_override.get("motor_norm_max") is not None:
+                motor_norm_max = np.array(motor_bounds_override["motor_norm_max"])
+            else:
+                motor_norm_max = stacked.max(axis=0)
 
             # Compute max absolute velocity across all consecutive frames
             all_vels = []
@@ -84,7 +96,9 @@ def create_dataset(
                 for i in range(1, len(ep.motor_positions)):
                     if ep.motor_positions[i] is not None and ep.motor_positions[i - 1] is not None:
                         all_vels.append(ep.motor_positions[i] - ep.motor_positions[i - 1])
-            if all_vels:
+            if motor_bounds_override and motor_bounds_override.get("motor_vel_norm_max") is not None:
+                motor_vel_norm_max = np.array(motor_bounds_override["motor_vel_norm_max"])
+            elif all_vels:
                 vel_stacked = np.stack(all_vels)
                 motor_vel_norm_max = np.abs(vel_stacked).max(axis=0)
             else:
@@ -98,10 +112,26 @@ def create_dataset(
     history = config.CANVAS_HISTORY_SIZE
     episode_indices = []
     canvas_actions = []  # Per-canvas action labels for evaluation
+    # Per-canvas acting-joint + decision-frame motor state. Used by
+    # evaluate.py's per-cell MSE breakdown to attribute prediction
+    # error to (joint, position-bin) cells, which the autonomous
+    # learner's per-joint sub-burst planner consumes. The acting
+    # joint is the same for every canvas built from one episode (one
+    # action per episode in this pipeline). Decision-frame motor state
+    # is the canvas window's first motor reading — the pose the action
+    # was applied from.
+    canvas_acting_joints: list = []
+    canvas_motor_states_at_decision: list = []
 
     for ep in episodes:
         ep_canvas_start = canvas_count
         valid_start = history - 1
+
+        # Acting joint for this episode (e.g. "shoulder_pan", no .pos suffix
+        # to match the recorder's motor_name convention).
+        ep_acting_joint = None
+        if ep.metadata and ep.metadata.get("joint_name"):
+            ep_acting_joint = str(ep.metadata["joint_name"]).replace(".pos", "")
 
         for frame_idx in tqdm(
             range(valid_start, len(ep.frames)),
@@ -129,6 +159,16 @@ def create_dataset(
             window_motors = None
             if has_motor and ep.motor_positions:
                 window_motors = ep.motor_positions[start_idx : frame_idx + 1]
+
+            # Per-canvas acting joint + decision-frame motor state for
+            # the per-cell MSE breakdown.
+            canvas_acting_joints.append(ep_acting_joint)
+            if window_motors and window_motors[0] is not None:
+                canvas_motor_states_at_decision.append(
+                    [float(x) for x in window_motors[0]]
+                )
+            else:
+                canvas_motor_states_at_decision.append(None)
 
             # Build interleaved list: [frame, action, frame, action, frame]
             interleaved = []
@@ -180,6 +220,8 @@ def create_dataset(
         "motor_vel_norm_max": motor_vel_norm_max.tolist() if motor_vel_norm_max is not None else None,
         "episodes": episode_indices,
         "canvas_actions": canvas_actions,
+        "canvas_acting_joints": canvas_acting_joints,
+        "canvas_motor_states_at_decision": canvas_motor_states_at_decision,
     }
 
     meta_path = Path(output_dir) / "dataset_meta.json"
@@ -243,8 +285,24 @@ if __name__ == "__main__":
         help=f"Parquet column for motor positions (default: {config.MOTOR_STATE_KEY}). "
              "Set to 'none' to disable motor strips.",
     )
+    parser.add_argument(
+        "--motor-bounds-json",
+        default=None,
+        help=(
+            "Optional JSON dict pinning motor-strip normalization bounds "
+            "(motor_norm_min, motor_norm_max, motor_vel_norm_max). "
+            "When set, these override the per-episode-derived min/max so "
+            "the motor-strip rendering stays stable across incremental "
+            "canvas builds. Example: "
+            '\'{"motor_norm_min":[-60,0,0,-90,-90,-45],'
+            '"motor_norm_max":[60,180,180,90,90,45]}\''
+        ),
+    )
 
     args = parser.parse_args()
+    motor_bounds_override = (
+        json.loads(args.motor_bounds_json) if args.motor_bounds_json else None
+    )
 
     # Parse episode argument
     ep = None
@@ -268,4 +326,5 @@ if __name__ == "__main__":
         frame_size=tuple(args.frame_size),
         episode=ep,
         state_column=state_col,
+        motor_bounds_override=motor_bounds_override,
     )

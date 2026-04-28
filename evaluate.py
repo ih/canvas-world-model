@@ -464,6 +464,30 @@ def compute_all_metrics(model, model_type, val_loader, patch_mask, meta,
     has_motor = meta.get("motor_strip_height", 0) > 0
     has_actions = False
 
+    # Per-(joint, position-bin) MSE accumulators. The autonomous learner's
+    # per-joint sub-burst planner consumes this to target hot cells.
+    # Bins are defined per-joint over the dataset's observed motor range
+    # (motor_norm_min/max), ensuring no empty bins for never-visited
+    # regions. Each cell's range is included in the output so the planner
+    # doesn't need to re-derive the binning convention.
+    per_cell_mse_accum: dict = {}    # (joint_name, bin_idx) -> {sum_mse, count}
+    per_cell_bin_ranges: dict = {}   # (joint_name, bin_idx) -> (lo, hi)
+    n_per_cell_bins = int(saved_args.get("per_cell_bins", 10))
+    canvas_acting_joints = meta.get("canvas_acting_joints") or []
+    canvas_motor_states = meta.get("canvas_motor_states_at_decision") or []
+    motor_norm_min = meta.get("motor_norm_min")
+    motor_norm_max = meta.get("motor_norm_max")
+    # SO-101 joint name -> motor_state index. Hardcoded to match
+    # SingleActionPolicy / streaming sequencer convention.
+    _SO101_JOINT_INDEX = {
+        "shoulder_pan": 0, "shoulder_lift": 1, "elbow_flex": 2,
+        "wrist_flex": 3, "wrist_roll": 4, "gripper": 5,
+    }
+    _per_cell_enabled = bool(
+        canvas_acting_joints and canvas_motor_states
+        and motor_norm_min is not None and motor_norm_max is not None
+    )
+
     # GPT-specific: per-position loss
     gpt_position_losses = None
     gpt_tf_loss = 0.0
@@ -499,6 +523,14 @@ def compute_all_metrics(model, model_type, val_loader, patch_mask, meta,
         actions_per_sample = get_last_action_per_sample(batch.get("actions", None), B)
         batch_mask = B_mask.expand(B, -1)
 
+        # Per-sample canvas index for per-cell MSE attribution
+        batch_canvas_indices = batch.get("index", None)
+        if batch_canvas_indices is not None:
+            if isinstance(batch_canvas_indices, torch.Tensor):
+                batch_canvas_indices = [int(batch_canvas_indices[i].item()) for i in range(B)]
+            else:
+                batch_canvas_indices = list(batch_canvas_indices)
+
         # Run inference
         pred = run_inference(model, model_type, canvas, patch_mask, patch_size,
                              grid_h, grid_w, saved_args, noise_scheduler)
@@ -532,7 +564,7 @@ def compute_all_metrics(model, model_type, val_loader, patch_mask, meta,
             total_ssim += compute_ssim(pred_last, gt_last) * B
             total_psnr += compute_psnr(pred_last, gt_last) * B
 
-        # --- Per-action MSE ---
+        # --- Per-action MSE + per-(joint, position-bin) MSE ---
         if actions_per_sample is not None:
             has_actions = True
             for i in range(B):
@@ -542,6 +574,39 @@ def compute_all_metrics(model, model_type, val_loader, patch_mask, meta,
                     action_mse[last_action] = [0.0, 0]
                 action_mse[last_action][0] += sample_mse
                 action_mse[last_action][1] += 1
+
+                # Per-cell bucketing. Skips no-op canvases (action=0)
+                # and any canvas missing acting-joint or motor-state
+                # metadata (older datasets predating sub-phase 1).
+                if (
+                    _per_cell_enabled
+                    and last_action != 0
+                    and batch_canvas_indices is not None
+                ):
+                    cidx = batch_canvas_indices[i]
+                    if 0 <= cidx < len(canvas_acting_joints):
+                        joint = canvas_acting_joints[cidx]
+                        state = canvas_motor_states[cidx]
+                        j_idx = _SO101_JOINT_INDEX.get(joint) if joint else None
+                        if j_idx is not None and state is not None:
+                            lo = float(motor_norm_min[j_idx])
+                            hi = float(motor_norm_max[j_idx])
+                            if hi > lo:
+                                pos = float(state[j_idx])
+                                bin_width = (hi - lo) / n_per_cell_bins
+                                bin_idx = int((pos - lo) / bin_width)
+                                bin_idx = max(0, min(n_per_cell_bins - 1, bin_idx))
+                                key = (joint, bin_idx)
+                                acc = per_cell_mse_accum.setdefault(
+                                    key, {"sum": 0.0, "count": 0}
+                                )
+                                acc["sum"] += sample_mse
+                                acc["count"] += 1
+                                if key not in per_cell_bin_ranges:
+                                    bin_lo = lo + bin_idx * bin_width
+                                    per_cell_bin_ranges[key] = (
+                                        bin_lo, bin_lo + bin_width
+                                    )
 
         # --- Static vs dynamic pixel MSE ---
         # Compare second-to-last frame with last frame to find dynamic pixels
@@ -695,6 +760,27 @@ def compute_all_metrics(model, model_type, val_loader, patch_mask, meta,
         for action_int, (s, c) in action_mse.items():
             results[f"val_mse_action_{action_int}"] = s / max(c, 1)
 
+    # Per-(joint, position-bin) MSE breakdown for the autonomous learner's
+    # per-joint sub-burst planner. Emits one entry per visited cell so the
+    # planner can read mean MSE + sample count + the cell's range without
+    # re-deriving the binning convention.
+    if per_cell_mse_accum:
+        per_cell = {}
+        for (joint, bin_idx), acc in per_cell_mse_accum.items():
+            cells = per_cell.setdefault(joint, [])
+            bin_lo, bin_hi = per_cell_bin_ranges[(joint, bin_idx)]
+            cells.append({
+                "bin": bin_idx,
+                "lo": float(bin_lo),
+                "hi": float(bin_hi),
+                "mean_mse": acc["sum"] / max(acc["count"], 1),
+                "count": acc["count"],
+            })
+        for joint, cells in per_cell.items():
+            cells.sort(key=lambda c: c["bin"])
+        results["per_cell_mse"] = per_cell
+        results["per_cell_bins"] = n_per_cell_bins
+
     if static_count > 0:
         results["val_mse_static"] = static_mse_sum / static_count
     if dynamic_count > 0:
@@ -834,11 +920,12 @@ def generate_counterfactual_images(model, model_type, val_loader, patch_mask, me
     gt_disp = to_display_range(canvas, normalize_mode)
 
     results = []
-    action_names = {0: "STAY (red)", 1: "MOVE+ (green)", 2: "MOVE- (blue)"}
+    action_ints = [1, 2, 3]  # move+, move-, stay (matching training data encoding)
+    action_names = {1: "MOVE+ (green)", 2: "MOVE- (blue)", 3: "STAY (red)"}
 
     # Run inference for each action
     preds_disp = {}
-    for action_int in range(3):
+    for action_int in action_ints:
         modified = replace_last_separator_action(canvas, meta, action_int, normalize_mode)
         pred = run_inference(model, model_type, modified, patch_mask, patch_size,
                              grid_h, grid_w, saved_args, noise_scheduler)
@@ -847,7 +934,7 @@ def generate_counterfactual_images(model, model_type, val_loader, patch_mask, me
     for i in range(B):
         sample = {"gt_canvas": gt_disp[i], "preds": {}, "motor_decoded": {}}
 
-        for action_int in range(3):
+        for action_int in action_ints:
             sample["preds"][action_int] = preds_disp[action_int][i]
 
         # Decode motor values
@@ -859,7 +946,7 @@ def generate_counterfactual_images(model, model_type, val_loader, patch_mask, me
                 sample["motor_decoded"]["gt_pos"] = gt_pos[0] if gt_pos is not None else None
                 sample["motor_decoded"]["gt_vel"] = gt_vel[0] if gt_vel is not None else None
 
-                for action_int in range(3):
+                for action_int in action_ints:
                     pred_strip = extract_last_frame_motor_strip(preds_disp[action_int][i:i+1], meta)
                     if pred_strip is not None:
                         pred_pos = decode_motor_positions(pred_strip, meta)
@@ -882,7 +969,8 @@ def save_counterfactual_images(counterfactual_results, output_dir, meta):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    action_names = {0: "STAY", 1: "MOVE+", 2: "MOVE-"}
+    action_ints = [1, 2, 3]  # move+, move-, stay (matching training data encoding)
+    action_names = {1: "MOVE+", 2: "MOVE-", 3: "STAY"}
     saved_images = []
 
     for idx, sample in enumerate(counterfactual_results):
@@ -891,7 +979,7 @@ def save_counterfactual_images(counterfactual_results, output_dir, meta):
 
         # Build grid: GT on top, then each action prediction
         rows = [tensor_to_pil(gt)]
-        for action_int in range(3):
+        for action_int in action_ints:
             rows.append(tensor_to_pil(sample["preds"][action_int]))
 
         grid_h_px = H * 4
@@ -902,10 +990,9 @@ def save_counterfactual_images(counterfactual_results, output_dir, meta):
         grid_path = output_dir / f"counterfactual_{idx:03d}.png"
         grid.save(grid_path)
 
-        # Error heatmap (GT vs pred with original action)
+        # Error heatmap (GT vs pred with stay action)
         gt_last = extract_last_frame_visual(gt.unsqueeze(0), meta)[0]  # [3, fH, fW]
-        # Use action 0 pred as default for error heatmap
-        pred_last = extract_last_frame_visual(sample["preds"][0].unsqueeze(0), meta)[0]
+        pred_last = extract_last_frame_visual(sample["preds"][3].unsqueeze(0), meta)[0]
         error = (gt_last - pred_last).pow(2).mean(dim=0).cpu().numpy()  # [fH, fW]
 
         # Normalize error for colormap
@@ -922,12 +1009,12 @@ def save_counterfactual_images(counterfactual_results, output_dir, meta):
         # Motor decoded table
         motor_decoded = sample.get("motor_decoded", {})
         if motor_decoded.get("gt_pos") is not None:
-            lines = ["Joint | GT Pos | STAY Pos | MOVE+ Pos | MOVE- Pos | GT Vel"]
+            lines = ["Joint | GT Pos | MOVE+ Pos | MOVE- Pos | STAY Pos | GT Vel"]
             gt_pos = motor_decoded["gt_pos"]
             gt_vel = motor_decoded.get("gt_vel")
             for j in range(len(gt_pos)):
                 vals = [f"J{j}", f"{gt_pos[j]:.4f}"]
-                for a in range(3):
+                for a in action_ints:
                     p = motor_decoded.get(f"pred_pos_{a}")
                     vals.append(f"{p[j]:.4f}" if p is not None else "N/A")
                 vals.append(f"{gt_vel[j]:.4f}" if gt_vel is not None else "N/A")
@@ -1186,6 +1273,11 @@ def parse_args():
                    help="Number of counterfactual samples to generate")
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--per-cell-bins", type=int, default=10,
+                   help="Number of position bins per joint for the per-cell MSE breakdown. "
+                        "Output appears in results JSON under `per_cell_mse`. "
+                        "The autonomous learner's per-joint sub-burst planner reads "
+                        "this to target hot (joint, position) cells.")
     p.add_argument("--no-html", action="store_true", help="Skip HTML report generation")
     p.add_argument("--analysis-notes", type=str, default=None,
                    help="Path to a text file with analysis notes to include in HTML report")
@@ -1240,6 +1332,11 @@ def main():
     output_dir = args.output_dir or f"local/eval/{args.model_type}"
 
     # --- Compute all metrics ---
+    # Thread the eval-only per_cell_bins knob through saved_args so
+    # compute_all_metrics can read it without changing its signature
+    # (saved_args is already passed in for model-specific config).
+    saved_args = dict(saved_args)
+    saved_args["per_cell_bins"] = int(args.per_cell_bins)
     print("\nComputing metrics...")
     metrics = compute_all_metrics(
         model, args.model_type, val_loader, patch_mask, meta, device,
