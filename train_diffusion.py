@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import json
 import sys
 import time
@@ -41,7 +42,20 @@ def parse_args():
 
     # Training
     p.add_argument("--epochs", type=int, default=200)
-    p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument("--batch-size", type=int, default=4,
+                   help="Per-step micro-batch. Effective batch = batch_size × gradient_accumulation_steps.")
+    p.add_argument("--gradient-accumulation-steps", type=int, default=1,
+                   help="Accumulate grads for N steps before optimizer.step(). Use with batch-size=1 "
+                        "to scale to large models without changing effective batch size.")
+    p.add_argument("--bf16", action="store_true",
+                   help="Run forward/backward in bf16 mixed precision (master weights stay fp32). "
+                        "Halves activation memory; required for ~1B+ models on a 32GB card.")
+    p.add_argument("--gradient-checkpointing", action="store_true",
+                   help="Recompute transformer-block activations during backward pass instead of "
+                        "storing them. Trades ~30% wall-time for ~3-5x activation memory savings.")
+    p.add_argument("--use-8bit-adam", action="store_true",
+                   help="Use bitsandbytes AdamW8bit instead of torch.optim.AdamW. "
+                        "Optimizer state goes from 8 bytes/param to 2 — saves ~6 GB at 1B.")
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.05)
     p.add_argument("--seed", type=int, default=42)
@@ -130,65 +144,79 @@ def log_sample_denoising(model, noise_scheduler, val_loader, patch_mask, device,
 
 def train_one_epoch(model, loader, optimizer, noise_scheduler, patch_mask, device,
                     patch_size, num_train_timesteps, prediction_type, epoch, num_epochs,
-                    grad_clip=0.0):
+                    grad_clip=0.0, bf16=False, grad_accum_steps=1):
+    """Train one epoch with optional bf16 autocast + gradient accumulation.
+
+    bf16: forward/backward in bf16. Master weights stay fp32 in the optimizer,
+        so accumulation is exact — no GradScaler needed (bf16 has fp32's
+        exponent range, only mantissa is reduced).
+    grad_accum_steps: divide loss by N and skip optimizer.step() until N
+        micro-batches have accumulated. Effective batch = micro × N.
+    """
     model.train()
     total_loss = 0.0
     total_grad_norm = 0.0
-    num_batches = 0
+    num_optimizer_steps = 0
+    num_microbatches = 0
 
+    autocast_ctx = (
+        torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if bf16 else contextlib.nullcontext()
+    )
+
+    optimizer.zero_grad()
     pbar = tqdm(loader, desc=f"Epoch {epoch}/{num_epochs} [train]", leave=False)
     for batch in pbar:
-        canvas = batch["canvas"].to(device)  # [B, 3, H, W] in [-1, 1]
+        canvas = batch["canvas"].to(device)
         B = canvas.shape[0]
-        batch_mask = patch_mask.expand(B, -1)  # [B, num_patches]
+        batch_mask = patch_mask.expand(B, -1)
 
-        target_patches = patchify(canvas, patch_size)  # [B, num_patches, p*p*3]
-
-        # Sample random timesteps
+        target_patches = patchify(canvas, patch_size)
         timesteps = torch.randint(0, num_train_timesteps, (B,), device=device)
-
-        # Sample noise
         noise = torch.randn_like(target_patches)
-
-        # Add noise to LAST FRAME patches only; keep context clean
         noisy_patches = noise_scheduler.add_noise(target_patches, noise, timesteps)
         composite_patches = torch.where(
-            batch_mask.unsqueeze(-1),
-            noisy_patches,
-            target_patches,
+            batch_mask.unsqueeze(-1), noisy_patches, target_patches,
         )
-
-        # Reconstruct canvas with noisy last frame
         grid_h = model.grid_h
         grid_w = model.grid_w
         noisy_canvas = unpatchify(composite_patches, patch_size, grid_h, grid_w)
 
-        # Forward: predict noise (or clean) given noisy canvas + timestep
-        pred_patches = model(noisy_canvas, timesteps)
+        with autocast_ctx:
+            pred_patches = model(noisy_canvas, timesteps)
+            loss_target = noise if prediction_type == "epsilon" else target_patches
+            loss = F.mse_loss(pred_patches[batch_mask], loss_target[batch_mask])
 
-        # Loss on masked patches only
-        if prediction_type == "epsilon":
-            loss_target = noise
-        else:
-            loss_target = target_patches
+        # Gradient accumulation: scale loss so the accumulated gradient
+        # equals what we'd get from a single forward over the full
+        # effective batch.
+        scaled_loss = loss / max(grad_accum_steps, 1)
+        scaled_loss.backward()
+        num_microbatches += 1
 
-        loss = F.mse_loss(pred_patches[batch_mask], loss_target[batch_mask])
+        if num_microbatches % grad_accum_steps == 0:
+            clip_val = grad_clip if grad_clip > 0 else float('inf')
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_val)
+            total_grad_norm += grad_norm.item()
+            optimizer.step()
+            optimizer.zero_grad()
+            num_optimizer_steps += 1
 
-        optimizer.zero_grad()
-        loss.backward()
+        total_loss += loss.item()
+        pbar.set_postfix(loss=f"{loss.item():.6f}")
 
+    # Flush any leftover micro-batches that didn't fill an accumulation
+    # window (e.g. if the loader's last batch fell mid-window).
+    if num_microbatches % grad_accum_steps != 0:
         clip_val = grad_clip if grad_clip > 0 else float('inf')
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_val)
         total_grad_norm += grad_norm.item()
-
         optimizer.step()
+        optimizer.zero_grad()
+        num_optimizer_steps += 1
 
-        total_loss += loss.item()
-        num_batches += 1
-        pbar.set_postfix(loss=f"{loss.item():.6f}")
-
-    avg_loss = total_loss / max(num_batches, 1)
-    avg_grad_norm = total_grad_norm / max(num_batches, 1)
+    avg_loss = total_loss / max(num_microbatches, 1)
+    avg_grad_norm = total_grad_norm / max(num_optimizer_steps, 1)
     return avg_loss, avg_grad_norm
 
 
@@ -266,12 +294,21 @@ def main():
         patch_size=args.patch_size,
         embed_dim=args.embed_dim, depth=args.depth, num_heads=args.num_heads,
         prediction_type=args.prediction_type,
+        gradient_checkpointing=args.gradient_checkpointing,
     ).to(device)
 
     num_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Model: Conditional Diffusion ViT, {num_params:.1f}M parameters")
     print(f"Canvas: {canvas_h}x{canvas_w}, patches: {model.grid_h}x{model.grid_w} = {model.num_patches}")
     print(f"Diffusion: {args.num_train_timesteps} timesteps, {args.beta_schedule} schedule, {args.prediction_type} prediction")
+    if args.bf16:
+        print(f"Mixed precision: bf16 autocast (master weights stay fp32)")
+    if args.gradient_checkpointing:
+        print(f"Gradient checkpointing: enabled (recompute block activations)")
+    if args.gradient_accumulation_steps > 1:
+        eff_batch = args.batch_size * args.gradient_accumulation_steps
+        print(f"Gradient accumulation: {args.gradient_accumulation_steps} steps "
+              f"(effective batch = {args.batch_size} x {args.gradient_accumulation_steps} = {eff_batch})")
 
     # --- Noise scheduler ---
     noise_scheduler = NoiseScheduler(
@@ -288,7 +325,18 @@ def main():
     print(f"Target region: {num_masked}/{model.num_patches} patches (last frame)")
 
     # --- Optimizer + Scheduler ---
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.use_8bit_adam:
+        try:
+            import bitsandbytes as bnb
+            optimizer = bnb.optim.AdamW8bit(
+                model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
+            )
+            print("Optimizer: bitsandbytes AdamW8bit (state in 8-bit, ~6 GB savings at 1B)")
+        except ImportError:
+            print("bitsandbytes not installed; falling back to torch.optim.AdamW")
+            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     if args.lr_schedule == "cosine":
         from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
         warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=args.warmup_epochs)
@@ -344,6 +392,8 @@ def main():
             model, train_loader, optimizer, noise_scheduler, patch_mask, device,
             args.patch_size, args.num_train_timesteps, args.prediction_type,
             epoch + 1, args.epochs, grad_clip=args.grad_clip,
+            bf16=args.bf16,
+            grad_accum_steps=args.gradient_accumulation_steps,
         )
 
         # Validate

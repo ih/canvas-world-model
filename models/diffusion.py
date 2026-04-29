@@ -120,6 +120,7 @@ class ConditionalDiffusionViT(nn.Module):
         num_heads=8,
         mlp_ratio=4.0,
         prediction_type="epsilon",
+        gradient_checkpointing=False,
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -127,6 +128,11 @@ class ConditionalDiffusionViT(nn.Module):
         self.grid_w = img_width // patch_size
         self.num_patches = self.grid_h * self.grid_w
         self.prediction_type = prediction_type
+        # Gradient checkpointing trades ~30% wall-time for ~3-5x activation
+        # memory savings — recompute each block's activations during the
+        # backward pass instead of storing them. Required when scaling
+        # past ~300M params on a 32GB card.
+        self.gradient_checkpointing = bool(gradient_checkpointing)
 
         # Patch embedding
         self.patch_embed = PatchEmbed(img_height, img_width, patch_size, 3, embed_dim)
@@ -205,8 +211,15 @@ class ConditionalDiffusionViT(nn.Module):
         c = self.time_embed(timesteps)  # [B, embed_dim]
 
         # DiT blocks
-        for blk in self.blocks:
-            tokens = blk(tokens, c)
+        if self.gradient_checkpointing and self.training:
+            import torch.utils.checkpoint as cp
+            for blk in self.blocks:
+                # use_reentrant=False is the new default and supports
+                # all our autograd patterns; explicit to silence warnings.
+                tokens = cp.checkpoint(blk, tokens, c, use_reentrant=False)
+        else:
+            for blk in self.blocks:
+                tokens = blk(tokens, c)
 
         # Final prediction
         gamma, beta = self.final_modulation(c).chunk(2, dim=-1)
