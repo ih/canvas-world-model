@@ -3,26 +3,31 @@
 import numpy as np
 from PIL import Image
 
+# Number of SO-101 joints encoded in the per-joint action mask on the
+# right half of each action separator. Ordering matches the motor strip's
+# left-to-right x-axis: [shoulder_pan, shoulder_lift, elbow_flex,
+# wrist_flex, wrist_roll, gripper].
+_DEFAULT_NUM_JOINTS = 6
 
-def _separator_color_for_action(action_dict: dict) -> tuple:
-    """Get RGB color for an action separator.
+# Joint-delta threshold (in motor-state units) above which a joint is
+# considered "acting" for a given step. The single_action policy moves a
+# joint by ±step_size (≥10 units), while non-acting joints fluctuate by
+# <1 unit of servo noise — this leaves a wide safety margin.
+_JOINT_ACTING_THRESHOLD = 1.0
 
-    Args:
-        action_dict: Action dictionary with 'action' int key, or plain int.
-            0->Red, 1->Green, 2->Blue.
 
-    Returns:
-        (R, G, B) tuple with values 0-255
-    """
-    # Handle plain int action
-    if isinstance(action_dict, int):
-        action_int = action_dict
-    elif isinstance(action_dict, dict):
-        action_int = action_dict.get('action', 0)
-    else:
-        action_int = 0
+def _action_int_from(action) -> int:
+    """Extract the discrete action code from either an int or a dict.
+    Unknown / None inputs coerce to 0 (buffer)."""
+    if isinstance(action, int):
+        return action
+    if isinstance(action, dict):
+        return int(action.get("action", 0))
+    return 0
 
-    # Standard action colors
+
+def _action_color_for_int(action_int: int) -> tuple:
+    """RGB color for a discrete action code."""
     if action_int == 0:
         return (255, 255, 0)  # Yellow: buffer
     elif action_int == 1:
@@ -33,6 +38,102 @@ def _separator_color_for_action(action_dict: dict) -> tuple:
         return (255, 0, 0)    # Red: stay (no movement)
     else:
         return (128, 128, 128)  # Gray: unknown
+
+
+def _separator_color_for_action(action_dict: dict) -> tuple:
+    """DEPRECATED helper kept for backward compat with external callers.
+
+    Returns a single RGB color for the action separator. New renderers
+    should use `_render_separator` which produces a two-column tile
+    (action color | per-joint action mask).
+    """
+    return _action_color_for_int(_action_int_from(action_dict))
+
+
+def _render_separator(
+    action,
+    sep_width: int,
+    canvas_h: int,
+    motor_before: np.ndarray = None,
+    motor_after: np.ndarray = None,
+    active_joints_mask=None,
+    num_joints: int = _DEFAULT_NUM_JOINTS,
+    joint_delta_threshold: float = _JOINT_ACTING_THRESHOLD,
+) -> np.ndarray:
+    """Render the action separator tile.
+
+    Layout: a `(canvas_h, sep_width, 3)` uint8 tile split vertically into
+    two equal-width columns:
+
+        [ left 16px: solid action color | right 16px: per-joint action mask ]
+
+    The right column is divided into `num_joints` horizontal bands (equal
+    height, last band absorbs the remainder). Each band is colored with
+    the action color if that joint is acting this step, or neutral gray
+    otherwise. For the default SO-101 layout (6 joints, 464 px tall
+    separator) this yields 5 bands of 77 px + 1 band of 79 px, ordered
+    top-to-bottom to match the motor strip's left-to-right x-axis:
+    shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll,
+    gripper.
+
+    Acting-joint determination priority:
+        1. `active_joints_mask` — explicit 6-bool array (live inference
+           path, where the caller knows exactly which joint it bumped).
+        2. Else derive from `|motor_after - motor_before|`: any joint
+           whose magnitude exceeds `joint_delta_threshold` is marked
+           acting (offline canvas-building path).
+        3. Else no signal available — all bands gray.
+
+    For `action == 3` (hold) the motor delta is effectively zero so the
+    right half is all gray and the left half is red; for `action == -1`
+    (the gray "inference boundary" marker used by the dashboard to
+    separate actual vs predicted frames) both halves end up gray because
+    the action color itself is gray.
+    """
+    action_int = _action_int_from(action)
+    action_color = _action_color_for_int(action_int)
+    gray = (128, 128, 128)
+
+    tile = np.full((canvas_h, sep_width, 3), gray, dtype=np.uint8)
+
+    left_w = sep_width // 2
+    right_w = sep_width - left_w
+
+    # Left column: solid action color (preserves the existing semantics —
+    # the top-left 16 px still encodes direction just like the old 32 px
+    # solid separator did).
+    tile[:, :left_w] = action_color
+
+    # Resolve the acting-joint mask
+    if active_joints_mask is None:
+        if motor_before is not None and motor_after is not None:
+            before = np.asarray(motor_before, dtype=np.float32)
+            after = np.asarray(motor_after, dtype=np.float32)
+            if before.shape == after.shape and before.size >= num_joints:
+                delta = np.abs(after[:num_joints] - before[:num_joints])
+                active_joints_mask = delta > joint_delta_threshold
+            else:
+                active_joints_mask = np.zeros(num_joints, dtype=bool)
+        else:
+            active_joints_mask = np.zeros(num_joints, dtype=bool)
+    active_joints_mask = np.asarray(active_joints_mask, dtype=bool)
+    if active_joints_mask.size < num_joints:
+        # pad shorter masks with False so the tile still renders
+        pad = np.zeros(num_joints - active_joints_mask.size, dtype=bool)
+        active_joints_mask = np.concatenate([active_joints_mask, pad])
+
+    # Right column: per-joint horizontal bands.
+    right_x = left_w
+    for j in range(num_joints):
+        y_start = (j * canvas_h) // num_joints
+        if j == num_joints - 1:
+            y_end = canvas_h
+        else:
+            y_end = ((j + 1) * canvas_h) // num_joints
+        band_color = action_color if bool(active_joints_mask[j]) else gray
+        tile[y_start:y_end, right_x:right_x + right_w] = band_color
+
+    return tile
 
 
 def _to_uint8(img: np.ndarray) -> np.ndarray:
@@ -251,10 +352,29 @@ def build_canvas(
 
         x_offset += target_w
 
-        # Place separator (except after last frame) — spans full height
+        # Place separator (except after last frame) — spans full height.
+        # New encoding: 16 px action color + 16 px per-joint action mask.
+        # The acting-joint mask is derived from the motor delta between
+        # the frame before and after this separator, when motor positions
+        # are available. Falls back to an all-gray right half when not.
         if frame_idx < num_seps:
-            sep_color = _separator_color_for_action(actions[frame_idx])
-            canvas[:, x_offset:x_offset + sep_width] = sep_color
+            motor_before = None
+            motor_after = None
+            if (
+                motor_positions is not None
+                and frame_idx < len(motor_positions)
+                and (frame_idx + 1) < len(motor_positions)
+            ):
+                motor_before = motor_positions[frame_idx]
+                motor_after = motor_positions[frame_idx + 1]
+            sep_tile = _render_separator(
+                actions[frame_idx],
+                sep_width=sep_width,
+                canvas_h=total_h,
+                motor_before=motor_before,
+                motor_after=motor_after,
+            )
+            canvas[:, x_offset:x_offset + sep_width] = sep_tile
             x_offset += sep_width
 
     return canvas

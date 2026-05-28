@@ -242,8 +242,14 @@ def main():
         print("Error: --fine-tune and --resume are mutually exclusive")
         sys.exit(1)
     if args.fine_tune:
-        ckpt = torch.load(args.fine_tune, map_location=device, weights_only=False)
+        # Load to CPU first so the saved dict (model + optimizer +
+        # scheduler state) doesn't pin VRAM during the load — see
+        # train_diffusion.py for the full rationale.
+        ckpt = torch.load(args.fine_tune, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
+        del ckpt
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         print(f"Fine-tuning from: {args.fine_tune} (weights only, fresh optimizer)")
     elif args.resume:
         start_epoch, best_val_loss = load_checkpoint(args.resume, model, optimizer, scheduler, device)

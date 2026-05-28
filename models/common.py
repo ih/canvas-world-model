@@ -45,14 +45,27 @@ def save_checkpoint(model, optimizer, scheduler, epoch, val_loss, path, extra=No
 
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None, device="cpu"):
-    """Load a training checkpoint. Returns (epoch, val_loss)."""
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    """Load a training checkpoint. Returns (epoch, val_loss).
+
+    Always loads to CPU first so the saved checkpoint dict (model +
+    optimizer + scheduler state) doesn't pin VRAM during the load.
+    `load_state_dict` then copies tensors into whatever device the
+    target model/optimizer already lives on.
+    """
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     if optimizer and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     if scheduler and "scheduler_state_dict" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-    return ckpt.get("epoch", 0), ckpt.get("val_loss", float("inf"))
+    epoch = ckpt.get("epoch", 0)
+    val_loss = ckpt.get("val_loss", float("inf"))
+    del ckpt
+    if isinstance(device, torch.device) and device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif isinstance(device, str) and device.startswith("cuda"):
+        torch.cuda.empty_cache()
+    return epoch, val_loss
 
 
 def compute_last_frame_patch_mask(canvas_h, canvas_w, patch_size, num_frames, sep_width, device="cpu"):

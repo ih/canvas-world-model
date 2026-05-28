@@ -56,6 +56,11 @@ def parse_args():
     p.add_argument("--use-8bit-adam", action="store_true",
                    help="Use bitsandbytes AdamW8bit instead of torch.optim.AdamW. "
                         "Optimizer state goes from 8 bytes/param to 2 — saves ~6 GB at 1B.")
+    p.add_argument("--gpu-mem-fraction", type=float, default=0.95,
+                   help="Cap PyTorch's allocator at this fraction of total VRAM. "
+                        "Forces a clean CUDA OOM at the cap rather than silent "
+                        "spillover to host-shared memory (which collapses throughput "
+                        "10-100x with no exception). 0 disables the cap.")
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.05)
     p.add_argument("--seed", type=int, default=42)
@@ -93,6 +98,20 @@ def parse_args():
     p.add_argument("--wandb-run-name", type=str, default=None)
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--log-images-every", type=int, default=10, help="Log sample denoising every N epochs")
+
+    # Live training previews: render a few inference samples to disk so the
+    # autonomous-learner dashboard has visual feedback during retrain. Off
+    # by default — only fires when --preview-dir is set.
+    p.add_argument("--preview-dir", type=str, default=None,
+                   help="If set, save inference preview canvases to this directory "
+                        "every --preview-every epochs.")
+    p.add_argument("--preview-every", type=int, default=5,
+                   help="Render previews every N epochs when --preview-dir is set.")
+    p.add_argument("--preview-num-samples", type=int, default=4,
+                   help="Number of val samples to render per preview burst.")
+    p.add_argument("--preview-num-steps", type=int, default=20,
+                   help="DDIM steps for preview inference. Lower than full eval "
+                        "to keep per-burst wall-time cost small (~5-10s).")
 
     return p.parse_args()
 
@@ -140,6 +159,62 @@ def log_sample_denoising(model, noise_scheduler, val_loader, patch_mask, device,
             combined = torch.cat([gt, pred_img], dim=1)
             images.append(wandb.Image(combined, caption=f"Top: GT, Bottom: Denoised (epoch {epoch})"))
         wandb.log({"denoised_predictions": images}, step=epoch)
+
+
+@torch.no_grad()
+def save_preview_canvases(model, noise_scheduler, val_loader, patch_mask, device,
+                          grid_h, grid_w, patch_size, num_inference_steps,
+                          num_samples, out_dir, epoch, prediction_type):
+    """Render `num_samples` val canvases via the canonical evaluate.run_inference
+    sampler and write GT-vs-predicted PNGs to `out_dir`. The autonomous-learner
+    dashboard tails this directory and surfaces them in its action-canvas
+    gallery while training runs.
+
+    val_loader uses shuffle=False, so `next(iter(val_loader))` is deterministic
+    — the same canvases evolve across epochs, which is what the user wants for
+    visual evolution tracking.
+
+    Reuses `evaluate.run_inference` so the preview goes through the SAME
+    sample-vs-epsilon-aware DDIM trajectory the offline evaluator uses.
+    Calling `noise_scheduler.step` directly with a strided timestep list is
+    incorrect — the scheduler treats `alpha_bar_prev` as `t-1`, not as the
+    actual previous step in the strided schedule, so most of the noise never
+    gets removed and the inferred frame stays gaussian.
+
+    Output filename pattern (matched by dashboard.parseCanvasName):
+        action_canvas_train_e{epoch:04d}_s{i}_{HHMMSS}.png
+    """
+    from PIL import Image  # local import keeps top-of-file lean
+    from evaluate import run_inference  # peer module in canvas-world-model
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    model.eval()
+    batch = next(iter(val_loader))
+    canvas = batch["canvas"][:num_samples].to(device)
+    B = canvas.shape[0]
+    if B == 0:
+        return
+
+    pred_canvas = run_inference(
+        model, "diffusion", canvas, patch_mask, patch_size,
+        grid_h, grid_w,
+        saved_args={"prediction_type": prediction_type},
+        noise_scheduler=noise_scheduler,
+    )
+
+    stamp = time.strftime("%H%M%S")
+    for i in range(B):
+        gt = (canvas[i].clamp(-1, 1).cpu() * 0.5 + 0.5)
+        pr = (pred_canvas[i].clamp(-1, 1).cpu() * 0.5 + 0.5)
+        # Stack vertically: GT on top, predicted on bottom. Same canvas
+        # geometry on both halves so the user can scan for divergence in
+        # the last-frame visual region.
+        combined = torch.cat([gt, pr], dim=1)  # CHW, concat along H
+        arr = (combined.permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype("uint8")
+        out_path = out_dir / f"action_canvas_train_e{epoch:04d}_s{i}_{stamp}.png"
+        Image.fromarray(arr).save(out_path)
 
 
 def train_one_epoch(model, loader, optimizer, noise_scheduler, patch_mask, device,
@@ -261,6 +336,9 @@ def main():
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    if device.type == "cuda" and args.gpu_mem_fraction > 0:
+        torch.cuda.set_per_process_memory_fraction(args.gpu_mem_fraction)
+        print(f"GPU memory cap: {args.gpu_mem_fraction:.2%} of total VRAM")
 
     # --- Data ---
     train_dataset = CanvasDataset(
@@ -354,8 +432,17 @@ def main():
         print("Error: --fine-tune and --resume are mutually exclusive")
         sys.exit(1)
     if args.fine_tune:
-        ckpt = torch.load(args.fine_tune, map_location=device, weights_only=False)
+        # Load to CPU first, copy weights into the GPU model, then release
+        # the checkpoint dict. Loading directly with map_location=device
+        # pins the entire saved dict (model + optimizer + scheduler state)
+        # in VRAM during load — ~6 GB of transient pressure for a 1B
+        # checkpoint, enough to push fine-tune above the spillover line
+        # while cold-start (no checkpoint load) sits comfortably.
+        ckpt = torch.load(args.fine_tune, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
+        del ckpt
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         print(f"Fine-tuning from: {args.fine_tune} (weights only, fresh optimizer)")
     elif args.resume:
         start_epoch, best_val_loss = load_checkpoint(args.resume, model, optimizer, scheduler, device)
@@ -440,6 +527,23 @@ def main():
                 f"lr={current_lr:.2e}, best_val={best_val_loss:.6f}, "
                 f"grad_norm={grad_norm:.4f}, tv_gap={train_val_gap:.6f}"
             )
+
+            # Live training previews. Wrapped in try/except so a render
+            # failure (e.g. PIL import error, full disk) NEVER kills the
+            # training run.
+            if args.preview_dir and args.preview_every > 0 and (epoch + 1) % args.preview_every == 0:
+                try:
+                    save_preview_canvases(
+                        model, noise_scheduler, val_loader, patch_mask, device,
+                        model.grid_h, model.grid_w, args.patch_size,
+                        num_inference_steps=args.preview_num_steps,
+                        num_samples=args.preview_num_samples,
+                        out_dir=args.preview_dir,
+                        epoch=epoch + 1,
+                        prediction_type=args.prediction_type,
+                    )
+                except Exception as e:
+                    print(f"[preview] render failed at epoch {epoch+1}: {e}")
 
             if wandb:
                 wandb.log({
